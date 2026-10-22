@@ -1,0 +1,61 @@
+general_settings:
+  master_key: os.environ/PROXY_MASTER_KEY
+credential_list:
+  - credential_name: litellm-backend-a
+    credential_values:
+      custom_llm_provider: litellm_proxy
+      api_key: os.environ/password
+      api_base: os.environ/website
+    credential_info:
+      description: os.environ/notesPlain
+      custom_llm_provider: os.environ/provider_name
+  - credential_name: litellm-backend-openrouter
+    credential_values:
+      api_key: os.environ/openrouter_key
+      api_base: os.environ/openrouter_api
+    credential_info:
+      description: OpenRouter
+      custom_llm_provider: OpenRouter
+  - credential_name: litellm-backend-nvidia-build
+    credential_values:
+      custom_llm_provider: litellm_proxy
+      api_key: REDACTED
+      api_base: https://integrate.api.nvidia.com/v1
+    credential_info:
+      description: https://build.nvidia.com
+      custom_llm_provider: NVIDIA Build
+model_list:
+  - model_name: t4c/Qwen3.8-27B
+    litellm_params:
+      model: openai/t4c/Qwen3.8-27B
+      api_base: http://10.44.255.20:8080/v1
+      api_key: "none"
+      stream: true
+      allowed_openai_params: [reasoning_effort]
+    model_info:
+      mode: chat
+      max_tokens: 262144
+      max_input_tokens: 262144
+      max_output_tokens: 32768
+      supports_vision: true
+      supports_function_calling: true
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+  - model_name: z-ai/glm-5.3-flash
+    litellm_params:
+      model: openrouter/z-ai/glm-5.3-flash
+      litellm_credential_name: litellm-backend-openrouter
+      stream: true
+      allowed_openai_params: [reasoning_effort]
+      provider:
+        zdr: true
+        sort:
+          by: price
+          partition: none
+        max_price: {}
+        quantizations: []
+        allow_fallbacks: true
+        data_collection: deny
+        require_parameters: true
+    model_info:
+      base_model: z-ai/glm-5.3-flash

@@ -1,0 +1,21 @@
+configuration:
+  master_key:
+    name: Master key
+    description: >-
+      Replace the default changeme1 with your API key. This required password
+      always replaces general_settings.master_key in the LiteLLM YAML and
+      is sent in discovery.
+  server_root_path:
+    name: API base path
+    description: >-
+      Required. The default is /v1. This option sets SERVER_ROOT_PATH and
+      the discovery path. Leave SERVER_ROOT_PATH out of the LiteLLM YAML.
+      Restart the app after a change.
+  litellm_config:
+    name: LiteLLM configuration
+    description: >-
+      Enter LiteLLM YAML. Use the YAML editor and a literal block
+      (litellm_config: |) for multiple lines.
+      The master key is always set by the password option.
+network:
+  4000/tcp: LiteLLM API (host access is optional)

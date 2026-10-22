@@ -1,0 +1,23 @@
+name: LiteLLM
+version: "1.97.0"
+slug: litellm
+description: Run the LiteLLM proxy with a YAML configuration.
+url: https://github.com/T4cC0re/HomeAssistant-Apps/tree/main/litellm
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: auto
+init: true
+ports:
+  4000/tcp: null
+discovery:
+  - litellm
+options:
+  master_key: changeme1
+  server_root_path: /v1
+  litellm_config: "{}"
+schema:
+  master_key: password
+  server_root_path: str
+  litellm_config: str
