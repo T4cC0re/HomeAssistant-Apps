@@ -1,5 +1,5 @@
 name: LiteLLM
-version: "1.97.0"
+version: "1.106.2"
 slug: litellm
 description: Run the LiteLLM proxy with a YAML configuration.
 url: https://github.com/T4cC0re/HomeAssistant-Apps/tree/main/litellm
