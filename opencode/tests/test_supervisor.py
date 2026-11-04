@@ -2,12 +2,14 @@
 
 from collections import deque
 import json
+from pathlib import Path
 import unittest
 from unittest.mock import AsyncMock, patch
 
 import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+import yaml
 
 from supervisor import (
     Supervisor,
@@ -44,7 +46,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         await self.server.start_server()
         self.session = aiohttp.ClientSession(trust_env=False)
         url = str(self.server.make_url(""))
-        self.supervisor = Supervisor(self.session, "test-supervisor-token", url, url)
+        self.supervisor = Supervisor(self.session, "test-supervisor-token", url, url, url)
         self.addAsyncCleanup(self.server.close)
         self.addAsyncCleanup(self.session.close)
 
@@ -53,6 +55,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
     def admin_info(self):
         self.respond({"hassio_api": True, "hassio_role": "admin", "ingress_url": "/api/hassio_ingress/test"})
+
+    def startup_probes(self):
+        self.respond({"version": "test"})
+        self.responses.append((403, "403: Forbidden"))
+        self.responses.append((401, "401: Unauthorized"))
 
     async def test_validator_posts_cookie_and_authenticates(self):
         self.respond()
@@ -99,16 +106,23 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_litellm_warns_with_discovery_disabled(self):
         self.admin_info()
+        self.startup_probes()
         self.respond({"discovery": [], "services": {}})
         self.respond({"addons": []})
         with self.assertLogs("supervisor", level="INFO") as logs:
             overlay = await self.supervisor.startup(litellm_discovery=False)
         self.assertEqual(overlay, {})
         self.assertTrue(any("not installed" in line for line in logs.output))
-        self.assertEqual([item["path"] for item in self.requests], ["/addons/self/info", "/discovery", "/addons"])
+        self.assertEqual([item["path"] for item in self.requests], [
+            "/addons/self/info", "/info", "/core/api/hassio/discovery",
+            "/api/hassio/discover", "/discovery", "/addons",
+        ])
+        self.assertTrue(all(item["authorization"] == "Bearer test-supervisor-token" for item in self.requests))
+        self.assertTrue(any("Probe " in line and "HTTP 403: 403: Forbidden" in line for line in logs.output))
 
     async def test_startup_uses_published_discovery_and_redacts_log(self):
         self.admin_info()
+        self.startup_probes()
         self.respond({"discovery": [{
             "addon": "local_litellm", "service": "litellm", "uuid": "record-1",
             "config": {"host": "local-litellm", "port": 4000, "path": "/v1", "master_key": "private-key"},
@@ -123,8 +137,63 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[redacted]", "\n".join(logs.output))
         add_models.assert_awaited_once_with(overlay)
 
+    async def test_probe_logs_raw_bodies_and_uses_valid_discovery(self):
+        self.admin_info()
+        self.responses.append((200, '{"result":"ok","data":{"version":"private-info"}}'))
+        self.respond({"discovery": [{
+            "addon": "local_litellm", "service": "litellm",
+            "config": {"host": "local-litellm", "port": 4000, "master_key": "private-probe-key"},
+        }]})
+        self.responses.append((403, "homeassistant-denied"))
+        self.responses.append((401, "401: Unauthorized"))
+        self.respond({"addons": [{"slug": "local_litellm", "state": "started"}]})
+        with patch.object(self.supervisor, "_add_models", new=AsyncMock()):
+            with self.assertLogs("supervisor", level="INFO") as logs:
+                overlay = await self.supervisor.startup()
+        output = "\n".join(logs.output)
+        self.assertIn('"ingress_url": "/api/hassio_ingress/test"', output)
+        self.assertIn('"version":"private-info"', output)
+        self.assertIn("private-probe-key", output)
+        self.assertIn("homeassistant-denied", output)
+        self.assertNotIn("test-supervisor-token", output)
+        self.assertEqual(overlay["provider"]["litellm"]["options"]["apiKey"], "private-probe-key")
+        self.assertTrue(all(item["authorization"] == "Bearer test-supervisor-token" for item in self.requests))
+        self.assertEqual([item["path"] for item in self.requests], [
+            "/addons/self/info", "/info", "/core/api/hassio/discovery",
+            "/api/hassio/discover", "/discovery", "/addons",
+        ])
+
+    async def test_probe_does_not_follow_redirect_or_log_echoed_token(self):
+        self.responses.append((302, "test-supervisor-token"))
+        with self.assertLogs("supervisor", level="INFO") as logs:
+            self.assertIsNone(await self.supervisor.probe_url(self.supervisor.base_url + "/info"))
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn("HTTP 302: [redacted SUPERVISOR_TOKEN]", "\n".join(logs.output))
+        self.assertNotIn("test-supervisor-token", "\n".join(logs.output))
+
+    async def test_probe_connection_failure_does_not_stop_startup(self):
+        self.supervisor.homeassistant_url = "http://127.0.0.1:1"
+        self.admin_info()
+        self.respond({"version": "test"})
+        self.responses.append((403, "403: Forbidden"))
+        self.respond({"discovery": []})
+        self.respond({"addons": []})
+        with self.assertLogs("supervisor", level="WARNING") as logs:
+            self.assertEqual(await self.supervisor.startup(), {})
+        self.assertTrue(any("could not be reached" in line and "ClientConnectorError" in line for line in logs.output))
+
+    async def test_self_info_denial_does_not_stop_probe_startup(self):
+        self.responses.append((403, "self-info-denied"))
+        self.startup_probes()
+        self.respond({"discovery": []})
+        self.respond({"addons": []})
+        with self.assertLogs("supervisor", level="INFO") as logs:
+            self.assertEqual(await self.supervisor.startup(), {})
+        self.assertIn("self-info-denied", "\n".join(logs.output))
+
     async def test_core_only_discovery_checks_core_proxy_without_reading_litellm_options(self):
         self.admin_info()
+        self.startup_probes()
         self.responses.append((401, "401: Unauthorized"))
         self.responses.append((401, {"result": "error", "message": "private-proxy-reason"}))
         self.responses.append((401, "401: Unauthorized"))
@@ -134,7 +203,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 overlay = await self.supervisor.startup()
         self.assertEqual(overlay, {})
         self.assertEqual([item["path"] for item in self.requests], [
-            "/addons/self/info", "/discovery", "/api/hassio/discover",
+            "/addons/self/info", "/info", "/core/api/hassio/discovery",
+            "/api/hassio/discover", "/discovery", "/api/hassio/discover",
             "/api/hassio/discovery", "/addons",
         ])
         self.assertTrue(all(item["authorization"] == "Bearer test-supervisor-token" for item in self.requests))
@@ -144,6 +214,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_valid_core_proxy_discovery_is_used_and_logged_without_secret(self):
         self.admin_info()
+        self.startup_probes()
         self.responses.append((401, "401: Unauthorized"))
         self.responses.append((401, "401: Unauthorized"))
         self.respond({"discovery": [{
@@ -160,16 +231,18 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disabled_discovery_does_not_read_litellm_options(self):
         self.admin_info()
+        self.startup_probes()
         self.responses.append((401, "401: Unauthorized"))
         self.responses.append((401, "401: Unauthorized"))
         self.responses.append((401, "401: Unauthorized"))
         self.respond({"addons": [{"slug": "local_litellm", "state": "started"}]})
         with self.assertLogs("supervisor", level="WARNING"):
             self.assertEqual(await self.supervisor.startup(litellm_discovery=False), {})
-        self.assertEqual(len(self.requests), 5)
+        self.assertEqual(len(self.requests), 8)
 
     async def test_other_service_cannot_supply_litellm_credentials(self):
         self.admin_info()
+        self.startup_probes()
         self.respond({"discovery": [{
             "addon": "different_litellm", "service": "litellm", "config": {"master_key": "private-key"},
         }], "services": {}})
@@ -201,6 +274,13 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_manifest_enables_core_api_for_version_0_0_3(self):
+        manifest = yaml.safe_load((Path(__file__).resolve().parents[1] / "config.yaml").read_text())
+        self.assertEqual(manifest["version"], "0.0.3")
+        self.assertTrue(manifest["hassio_api"])
+        self.assertEqual(manifest["hassio_role"], "admin")
+        self.assertTrue(manifest["homeassistant_api"])
+
     def test_redaction_removes_all_nonpublic_config_fields(self):
         data = {"discovery": [{"service": "litellm", "config": {
             "host": "local-litellm", "port": 4000, "master_key": "private-master-key",

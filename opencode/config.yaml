@@ -1,5 +1,5 @@
 name: OpenCode
-version: "0.0.2"
+version: "0.0.3"
 slug: opencode
 description: Run one OpenCode instance for each Home Assistant user.
 url: https://github.com/T4cC0re/HomeAssistant-Apps/tree/main/opencode
@@ -16,6 +16,7 @@ watchdog: "http://[HOST]:[PORT:8080]/_supervisor/watchdog"
 panel_icon: mdi:robot
 hassio_api: true
 hassio_role: admin
+homeassistant_api: true
 ports:
   8080/tcp: 8080
 map:

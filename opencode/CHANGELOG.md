@@ -1,5 +1,11 @@
 # Changes
 
+## 0.0.3
+
+- Allow access to the Home Assistant Core API through Supervisor.
+- Log the status and response body for four API probes at startup.
+- Keep the app running when a probe is denied or cannot connect.
+
 ## 0.0.2
 
 - Start OpenCode without the Landlock file sandbox on Home Assistant OS.

@@ -110,6 +110,16 @@ On startup, the app calls `GET /discovery` and logs the response without
 private configuration values. Master keys, tokens, and unknown
 configuration values are redacted.
 
+The app also probes `http://supervisor/addons/self/info`,
+`http://supervisor/info`,
+`http://supervisor/core/api/hassio/discovery`, and
+`http://homeassistant/api/hassio/discover`. It sends the app's
+`SUPERVISOR_TOKEN` on each request. It logs each HTTP status and the
+response body, or a connection error. These response bodies can contain
+private data. The app never logs the request token. A denied or unreachable
+probe does not stop startup. If a probe returns valid discovery data, the
+app can use it for the LiteLLM provider.
+
 Home Assistant currently restricts this endpoint to Core. If the call is
 denied, the app checks `http://192.168.178.147:8123/api/hassio/discover`
 and `/api/hassio/discovery` with its admin-role app token. It logs each

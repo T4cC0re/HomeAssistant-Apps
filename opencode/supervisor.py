@@ -11,6 +11,7 @@ LOGGER = logging.getLogger(__name__)
 CORE_ONLY_ENDPOINTS = {"/discovery", "/ingress/validate_session"}
 PUBLIC_DISCOVERY_FIELDS = {"host", "port", "path", "ssl", "protocol"}
 CORE_PROXY_URL = "http://192.168.178.147:8123"
+HOMEASSISTANT_URL = "http://homeassistant"
 
 
 class SupervisorError(RuntimeError):
@@ -81,17 +82,23 @@ class Supervisor:
     """Use a caller-owned HTTP session to read the Supervisor API."""
 
     def __init__(self, session: aiohttp.ClientSession, token: str, base_url: str = "http://supervisor",
-                 core_proxy_url: str = CORE_PROXY_URL):
+                 core_proxy_url: str = CORE_PROXY_URL, homeassistant_url: str = HOMEASSISTANT_URL):
         if not isinstance(token, str) or not token:
             raise SupervisorError("SUPERVISOR_TOKEN is required.")
         self.session = session
         self.token = token
         self.base_url = base_url.rstrip("/")
         self.core_proxy_url = core_proxy_url.rstrip("/")
+        self.homeassistant_url = homeassistant_url.rstrip("/")
         self.info: dict = {}
 
-    async def request(self, method: str, path: str, payload: dict | None = None) -> dict:
-        """Send an authenticated request without logging private response data."""
+    def _safe_probe_body(self, body: str) -> str:
+        """Keep the app token out of a response body log."""
+        return body.replace(self.token, "[redacted SUPERVISOR_TOKEN]")
+
+    async def request(self, method: str, path: str, payload: dict | None = None,
+                      log_response: bool = False) -> dict:
+        """Send an authenticated request and log the body only when asked."""
         try:
             async with self.session.request(
                 method,
@@ -105,7 +112,11 @@ class Supervisor:
                 status = response.status
                 content_type = response.content_type
         except (aiohttp.ClientError, TimeoutError, UnicodeError):
+            if log_response:
+                LOGGER.warning("Supervisor %s could not be reached.", path)
             raise SupervisorError(f"The Supervisor request to {path} failed.") from None
+        if log_response:
+            LOGGER.info("Supervisor %s HTTP %s: %s", path, status, self._safe_probe_body(body))
         if (
             path in CORE_ONLY_ENDPOINTS
             and self.info.get("hassio_role") == "admin"
@@ -134,8 +145,36 @@ class Supervisor:
 
     async def self_info(self) -> dict:
         """Read the app information and retain proof of API access."""
-        self.info = await self.request("GET", "/addons/self/info")
+        self.info = await self.request("GET", "/addons/self/info", log_response=True)
         return self.info
+
+    async def probe_url(self, url: str) -> dict | None:
+        """Log one probe response and return valid discovery data."""
+        try:
+            async with self.session.get(
+                url,
+                headers={"Authorization": f"Bearer {self.token}", "Accept-Encoding": "identity"},
+                timeout=aiohttp.ClientTimeout(total=5),
+                allow_redirects=False,
+            ) as response:
+                status = response.status
+                body = await response.text()
+        except (aiohttp.ClientError, TimeoutError, UnicodeError) as error:
+            LOGGER.warning("Probe %s could not be reached: %s", url, type(error).__name__)
+            return None
+        LOGGER.info("Probe %s HTTP %s: %s", url, status, self._safe_probe_body(body))
+        if status != 200:
+            return None
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            return None
+        if not isinstance(payload, dict) or payload.get("result") != "ok":
+            return None
+        data = payload.get("data")
+        if isinstance(data, dict) and isinstance(data.get("discovery"), list):
+            return data
+        return None
 
     async def validate_session(self, token: str) -> bool:
         """Check a session, or report a known Core-only API restriction."""
@@ -193,14 +232,22 @@ class Supervisor:
 
     async def startup(self, litellm_discovery: bool = True) -> dict:
         """Log discovery data, check LiteLLM, and return its provider config."""
-        await self.self_info()
+        try:
+            await self.self_info()
+        except SupervisorError as error:
+            LOGGER.warning("Cannot read Supervisor app information: %s", error)
+        await self.probe_url(self.base_url + "/info")
+        probe_discovery = await self.probe_url(self.base_url + "/core/api/hassio/discovery")
+        candidate = await self.probe_url(self.homeassistant_url + "/api/hassio/discover")
+        if probe_discovery is None:
+            probe_discovery = candidate
         discovery = None
         try:
             discovery = await self.request("GET", "/discovery")
             LOGGER.info("Supervisor /discovery: %s", json.dumps(redact_discovery(discovery), sort_keys=True))
         except SupervisorError as error:
             LOGGER.warning("Cannot read Supervisor /discovery: %s", error)
-            discovery = await self.probe_core_proxy()
+            discovery = probe_discovery or await self.probe_core_proxy()
         addons = await self.request("GET", "/addons")
         installed = addons.get("addons")
         if not isinstance(installed, list):
