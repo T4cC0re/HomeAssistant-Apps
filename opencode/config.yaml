@@ -1,5 +1,5 @@
 name: OpenCode
-version: "0.0.5"
+version: "0.0.7"
 slug: opencode
 description: Run one OpenCode instance for each Home Assistant user.
 url: https://github.com/T4cC0re/HomeAssistant-Apps/tree/main/opencode

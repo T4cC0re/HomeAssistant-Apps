@@ -13,7 +13,7 @@ npm = "12.2.1"
 [tasks.opencode]
 description = "Start the OpenCode instance for one user."
 dir = "{{ env.HOME }}"
-run = 'exec opencode web --hostname 127.0.0.1 --port "$OPENCODE_PORT"'
+run = 'exec opencode serve --hostname 127.0.0.1 --port "$OPENCODE_PORT" --print-logs'
 quiet = true
 deny_env = true
 allow_env = [
@@ -34,3 +34,17 @@ allow_env = [
 
 [tasks.opencode.env]
 OPENCODE_DISABLE_AUTOUPDATE = "true"
+
+[tasks.deploy]
+tools = {}
+run = """
+#!/usr/bin/env bash
+set -xeufo pipefail
+OPENCODE_SMB_MOUNT=$(mktemp -d /private/tmp/opencode-smb.XXXXXX)
+mount_smbfs //homeassistant:homeassistant@192.168.178.147/local_apps "$OPENCODE_SMB_MOUNT"
+rsync -rlt --checksum --delete --dry-run --itemize-changes --exclude='__pycache__/' --exclude='*.pyc' ./ "$OPENCODE_SMB_MOUNT/opencode/"
+rsync -rlt --checksum --delete --itemize-changes --exclude='__pycache__/' --exclude='*.pyc' ./ "$OPENCODE_SMB_MOUNT/opencode/"
+rsync -rlt --checksum --delete --dry-run --itemize-changes --exclude='__pycache__/' --exclude='*.pyc' ./ "$OPENCODE_SMB_MOUNT/opencode/"
+umount "$OPENCODE_SMB_MOUNT"
+rmdir "$OPENCODE_SMB_MOUNT"
+"""
