@@ -36,19 +36,6 @@ HOP_HEADERS = {
 PRIVATE_HEADERS = {"authorization", "cookie", "host", "forwarded", "x-supervisor-token"}
 
 
-@web.middleware
-async def log_requests(request: web.Request, handler):
-    """Log the user ID header for each request without logging private data."""
-    user_id = request.headers.get("X-Remote-User-Id")
-    LOG.info(
-        "Request %s %s X-Remote-User-Id=%s",
-        request.method,
-        json.dumps(request.path, ensure_ascii=True),
-        json.dumps(user_id if user_id is not None else "<missing>", ensure_ascii=True),
-    )
-    return await handler(request)
-
-
 class WatchdogMonitor:
     """Warn when Supervisor stops calling the app watchdog."""
 
@@ -150,8 +137,6 @@ class Instance:
     username: str
     process: asyncio.subprocess.Process
     password: str
-    prefix: str
-    origin: str
 
     @property
     def port(self) -> int:
@@ -244,9 +229,7 @@ class Instances:
         async with self.locks.setdefault(user_id, asyncio.Lock()):
             old = self.running.get(user_id)
             if old and old.process.returncode is None:
-                if (old.prefix, old.origin) == (prefix, origin):
-                    return old
-                await self.stop(old)
+                return old
             home = self.home(user_id, username)
             password = secrets.token_urlsafe(32)
             kwargs = {}
@@ -257,7 +240,7 @@ class Instances:
                 cwd=home, env=self.environment(user_id, username, home, prefix, origin, password),
                 start_new_session=True, **kwargs,
             )
-            instance = Instance(user_id, username, process, password, prefix, origin)
+            instance = Instance(user_id, username, process, password)
             self.running[user_id] = instance
             try:
                 await self.ready(instance)
@@ -512,7 +495,7 @@ async def create_app(options_path=Path("/data/options.json"), data_dir=Path("/da
     token = os.environ.pop("SUPERVISOR_TOKEN", "")
     if not token:
         raise ValueError("SUPERVISOR_TOKEN is required. Start this app through Home Assistant.")
-    app = web.Application(client_max_size=0, middlewares=[log_requests])
+    app = web.Application(client_max_size=0)
     app[WATCHDOG_KEY] = WatchdogMonitor()
 
     async def lifecycle(app):

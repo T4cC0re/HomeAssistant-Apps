@@ -29,10 +29,9 @@ If the user name is empty, it returns HTTP `500` with an error message.
 Other missing or invalid fields cause the request to fail before a user
 or process is created.
 
-The gateway logs the `X-Remote-User-Id` header for each request. This is
-the Home Assistant user ID from ingress, not the numeric ID in `users.db`.
-Requests without the header get a missing marker in the log. The gateway
-does not log cookies or query strings.
+The gateway does not log each ingress request. It logs process starts,
+errors, and watchdog events. It uses the user name to select a process.
+The `X-Remote-User-Id` header and the session cookie do not select a process.
 
 The gateway calls `POST /ingress/validate_session`. Home Assistant
 currently restricts this endpoint to Core, even when an app has the admin
@@ -73,10 +72,11 @@ with numeric user ID `10000 + id` and group `0`. It does not pass the
 Supervisor token or the parent environment to the process.
 
 The gateway detects the public URL and ingress prefix from each trusted
-request. It supplies them to the mise task with the OpenCode configuration.
-If the URL or prefix changes, it restarts that user's server before it
-forwards the request. An eagerly started server gets this configuration
-on the user's first ingress request.
+request. It uses them to serve the web interface and forward that request.
+A new session cookie, URL, or prefix does not restart a live server.
+The server receives the URL and prefix from its first start, including empty
+values when `lazy_start` is `false`. If the server stops, the next request
+starts a replacement.
 
 The proxy streams HTTP request and response bodies. It supports server
 sent events and WebSocket upgrades without an app request size limit.
@@ -149,8 +149,9 @@ after it has sent a request, the app warns until you restart it.
 
 ## Web interface
 
-The Docker build uses the same OpenCode version for the server and web
-interface. `prepare_frontend.py` adds the ingress prefix to the web
+The Docker build uses OpenCode 2.2.5 for the server and the OpenCode 1.19.5
+source for the web interface. Compatibility between these versions has not
+been checked. `prepare_frontend.py` adds the ingress prefix to the web
 interface's router and API URL. It stops the build if the expected source
 code changes. `frontend.py` supplies the current prefix when it serves the
 HTML page. This keeps assets, navigation, HTTP requests, events, and

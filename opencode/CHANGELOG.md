@@ -1,5 +1,12 @@
 # Changes
 
+## 0.0.4
+
+- Stop logging every ingress request.
+- Keep one live OpenCode process per user when the ingress URL changes.
+- Replace a user's process only after it stops.
+- Use OpenCode 2.2.5 through mise for the server.
+
 ## 0.0.3
 
 - Allow access to the Home Assistant Core API through Supervisor.

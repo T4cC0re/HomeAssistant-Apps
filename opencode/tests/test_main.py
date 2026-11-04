@@ -80,26 +80,44 @@ class StoreTests(unittest.TestCase):
 
 
 class GatewayLogTests(unittest.IsolatedAsyncioTestCase):
-    async def test_user_id_is_logged_for_accepted_and_rejected_requests(self):
-        async def handler(request):
-            if request.path == "/denied":
-                raise web.HTTPForbidden
-            return web.Response(text="ok")
+    async def test_routine_ingress_requests_are_not_logged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "options.json").write_text("{}")
+            supervisor = SimpleNamespace(startup=AsyncMock(return_value={}),
+                                         validate_session=AsyncMock(return_value=True))
+            managers = []
 
-        app = web.Application(middlewares=[main.log_requests])
-        app.router.add_route("*", "/{path:.*}", handler)
-        client = TestClient(TestServer(app))
-        await client.start_server()
-        try:
-            with self.assertLogs("opencode", level="INFO") as logs:
-                accepted = await client.get('/ok?private=secret', headers={"X-Remote-User-Id": 'abc"123'})
-                rejected = await client.get("/denied?private=secret")
-            self.assertEqual((accepted.status, rejected.status), (200, 403))
-            self.assertIn('X-Remote-User-Id="abc\\"123"', logs.output[0])
-            self.assertIn('X-Remote-User-Id="<missing>"', logs.output[1])
-            self.assertNotIn("private=secret", "\n".join(logs.output))
-        finally:
-            await client.close()
+            def make_manager(store, *_args):
+                manager = SimpleNamespace(
+                    store=store, seen_users={},
+                    ensure=AsyncMock(return_value=SimpleNamespace(port=8081, password="backend-key")),
+                    close=AsyncMock(),
+                )
+                managers.append(manager)
+                return manager
+
+            with patch.dict(os.environ, {"SUPERVISOR_TOKEN": "gateway-only"}), \
+                    patch.object(main, "Supervisor", return_value=supervisor), \
+                    patch.object(main, "Instances", side_effect=make_manager), \
+                    patch.object(main, "TRUSTED_INGRESS", ipaddress.ip_address("127.0.0.1")):
+                app = await main.create_app(path / "options.json", path)
+                client = TestClient(TestServer(app))
+                await client.start_server()
+                try:
+                    headers = {
+                        "X-Remote-User-Name": "Alice", "X-Remote-User-Id": "ha-user-id",
+                        "X-Ingress-Path": PREFIX, "X-Forwarded-Proto": "https",
+                        "X-Forwarded-Host": "ha.example", "Cookie": "ingress_session=one",
+                    }
+                    with self.assertNoLogs("opencode", level="INFO"):
+                        accepted = await client.get(PREFIX, headers=headers, allow_redirects=False)
+                        rejected = await client.get(PREFIX, headers={**headers, "X-Remote-User-Name": ""},
+                                                    allow_redirects=False)
+                    self.assertEqual((accepted.status, rejected.status), (308, 500))
+                    self.assertEqual(managers[0].ensure.await_count, 1)
+                finally:
+                    await client.close()
 
 
 class WatchdogTests(unittest.IsolatedAsyncioTestCase):
@@ -139,8 +157,8 @@ class WatchdogTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertLogs("opencode", level="INFO") as logs:
                         response = await client.get(main.WATCHDOG_PATH)
                     self.assertEqual(response.status, 200)
-                    self.assertTrue(any('X-Remote-User-Id="<missing>"' in line for line in logs.output))
                     self.assertTrue(any("watchdog request received" in line for line in logs.output))
+                    self.assertFalse(any("X-Remote-User-Id" in line for line in logs.output))
                     store = main.UserStore(path)
                     try:
                         self.assertEqual(store.all(), [])
@@ -319,7 +337,52 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProcessTests(unittest.IsolatedAsyncioTestCase):
-    async def test_concurrent_requests_start_one_process_and_changed_prefix_restarts_it(self):
+    async def test_different_sessions_and_urls_share_one_user_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = main.UserStore(Path(directory))
+            self.addCleanup(store.close)
+            async with aiohttp.ClientSession() as upstream:
+                manager = main.Instances(store, upstream, {})
+                manager.ready = AsyncMock()
+                manager.stop = AsyncMock()
+                supervisor = SimpleNamespace(validate_session=AsyncMock(return_value=True))
+                gateway = main.Gateway(supervisor, manager, upstream)
+                app = web.Application()
+                app.router.add_route("*", "/{path:.*}", gateway.handle)
+                client = TestClient(TestServer(app))
+                await client.start_server()
+                try:
+                    def request_headers(prefix, host, session):
+                        return {
+                            "X-Remote-User-Name": "Alice", "X-Remote-User-Id": "ha-user-id",
+                            "X-Ingress-Path": prefix, "X-Forwarded-Proto": "https",
+                            "X-Forwarded-Host": host, "Cookie": f"ingress_session={session}",
+                        }
+
+                    process = SimpleNamespace(returncode=None, pid=999)
+                    with patch.object(main, "TRUSTED_INGRESS", ipaddress.ip_address("127.0.0.1")), \
+                            patch.object(main.asyncio, "create_subprocess_exec",
+                                         AsyncMock(return_value=process)) as start:
+                        paths = (PREFIX, PREFIX + "-other")
+                        responses = await asyncio.gather(
+                            client.get(paths[0], headers=request_headers(paths[0], "ha.example", "session-a"),
+                                       allow_redirects=False),
+                            client.get(paths[1], headers=request_headers(paths[1], "other.example", "session-b"),
+                                       allow_redirects=False),
+                        )
+                    self.assertEqual([response.status for response in responses], [308, 308])
+                    self.assertEqual([response.headers["Location"] for response in responses],
+                                     [path + "/" for path in paths])
+                    self.assertEqual([call.args[0] for call in supervisor.validate_session.await_args_list],
+                                     ["session-a", "session-b"])
+                    self.assertEqual(store.all(), [(1, "Alice")])
+                    self.assertEqual(start.await_count, 1)
+                    self.assertEqual(list(manager.running), [1])
+                    manager.stop.assert_not_awaited()
+                finally:
+                    await client.close()
+
+    async def test_concurrent_requests_reuse_one_process_across_urls(self):
         with tempfile.TemporaryDirectory() as directory:
             store = main.UserStore(Path(directory))
             self.addCleanup(store.close)
@@ -336,9 +399,33 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(start.await_count, 1)
                 self.assertEqual(start.call_args.args, ("mise", "-C", str(main.APP_DIR), "run", "opencode"))
                 self.assertNotIn("SUPERVISOR_TOKEN", start.call_args.kwargs["env"])
-                await manager.ensure(1, "Alice", PREFIX + "-new", "https://ha.example")
-                self.assertEqual(start.await_count, 2)
-                manager.stop.assert_awaited_once_with(first)
+                third = await manager.ensure(1, "Alice", PREFIX + "-new", "https://other.example")
+                self.assertIs(third, first)
+                self.assertEqual(start.await_count, 1)
+                manager.stop.assert_not_awaited()
+
+    async def test_exited_process_is_replaced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = main.UserStore(Path(directory))
+            self.addCleanup(store.close)
+            manager = main.Instances(store, None, {})
+            manager.ready = AsyncMock()
+            manager.stop = AsyncMock()
+            old_process = SimpleNamespace(returncode=None, pid=999)
+            new_process = SimpleNamespace(returncode=None, pid=1000)
+            with patch.object(main.asyncio, "create_subprocess_exec",
+                              AsyncMock(side_effect=[old_process, new_process])) as start:
+                first = await manager.ensure(1, "Alice", PREFIX, "https://ha.example")
+                old_process.returncode = 0
+                second, third = await asyncio.gather(
+                    manager.ensure(1, "Alice", PREFIX + "-new", "https://other.example"),
+                    manager.ensure(1, "Alice", PREFIX, "https://ha.example"),
+                )
+            self.assertIs(second, third)
+            self.assertIsNot(second, first)
+            self.assertEqual(start.await_count, 2)
+            self.assertIs(manager.running[1], second)
+            manager.stop.assert_not_awaited()
 
     async def test_failed_start_is_stopped_and_removed(self):
         with tempfile.TemporaryDirectory() as directory:

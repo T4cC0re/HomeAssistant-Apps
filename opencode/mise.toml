@@ -1,11 +1,11 @@
 [tools]
-"aqua:anomalyco/opencode" = "1.19.5"
+"opencode" = "2.2.5"
 "aqua:BurntSushi/ripgrep" = "15.2.0"
 bun = "1.4.4"
 python = "3.14.10"
 
 [settings]
-auto_install = false
+auto_install = true
 
 [tasks.opencode]
 description = "Start the OpenCode instance for one user."
