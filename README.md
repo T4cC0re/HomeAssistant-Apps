@@ -5,6 +5,7 @@ Apps for Home Assistant.
 | App | Description | Documentation |
 | --- | --- | --- |
 | [LiteLLM](litellm/README.md) | Run the LiteLLM proxy with a YAML configuration. | [Configuration](litellm/DOCS.md) |
+| [OpenCode](opencode/README.md) | Run one OpenCode server for each Home Assistant user. | [Configuration](opencode/DOCS.md) |
 
 ## Install from the repository
 
@@ -18,6 +19,9 @@ To add the repository manually:
 4. Select **LiteLLM** from this repository and select **Install**.
 
 See the [Home Assistant repository guide](https://contributors.home-assistant.io/apps/guides/repository/) for details.
+
+To install OpenCode, select **OpenCode** from the same repository. See the
+[OpenCode installation instructions](opencode/README.md) for a local copy.
 
 ## Install a local copy
 

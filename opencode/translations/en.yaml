@@ -1,0 +1,15 @@
+configuration:
+  lazy_start:
+    name: Start instances on request
+    description: >-
+      Start an OpenCode instance when the user first opens the app.
+      If this option is off, start an instance for each saved user when
+      the app starts.
+  litellm_discovery:
+    name: Find LiteLLM
+    description: >-
+      Get the LiteLLM connection settings from the Supervisor and add
+      them to each OpenCode instance. The app logs a warning if LiteLLM
+      is not installed.
+network:
+  8080/tcp: OpenCode gateway (requires Home Assistant Ingress)

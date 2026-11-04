@@ -1,0 +1,30 @@
+name: OpenCode
+version: "0.0.2"
+slug: opencode
+description: Run one OpenCode instance for each Home Assistant user.
+url: https://github.com/T4cC0re/HomeAssistant-Apps/tree/main/opencode
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: auto
+init: true
+ingress: true
+ingress_stream: true
+ingress_port: 8080
+watchdog: "http://[HOST]:[PORT:8080]/_supervisor/watchdog"
+panel_icon: mdi:robot
+hassio_api: true
+hassio_role: admin
+ports:
+  8080/tcp: 8080
+map:
+  - type: homeassistant_config
+    read_only: false
+    path: /homeassistant
+options:
+  lazy_start: true
+  litellm_discovery: true
+schema:
+  lazy_start: bool
+  litellm_discovery: bool

@@ -1,0 +1,33 @@
+[tools]
+"aqua:anomalyco/opencode" = "1.19.5"
+"aqua:BurntSushi/ripgrep" = "15.2.0"
+bun = "1.4.4"
+python = "3.14.10"
+
+[settings]
+auto_install = false
+
+[tasks.opencode]
+description = "Start the OpenCode instance for one user."
+dir = "{{ env.HOME }}"
+run = 'exec opencode web --hostname 127.0.0.1 --port "$OPENCODE_PORT"'
+quiet = true
+deny_env = true
+allow_env = [
+  "OPENCODE_USERNAME",
+  "OPENCODE_PORT",
+  "OPENCODE_CONFIG_CONTENT",
+  "OPENCODE_SERVER_PASSWORD",
+  "OPENCODE_SERVER_USERNAME",
+  "OPENCODE_PUBLIC_URL",
+  "OPENCODE_INGRESS_PATH",
+  "OPENCODE_DISABLE_AUTOUPDATE",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_STATE_HOME",
+  "TMPDIR",
+]
+
+[tasks.opencode.env]
+OPENCODE_DISABLE_AUTOUPDATE = "true"
