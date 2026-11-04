@@ -1,5 +1,10 @@
 # Changes
 
+## 0.0.5
+
+- Install tools through mise when the container starts.
+- Prune old mise tool versions after installation.
+
 ## 0.0.4
 
 - Stop logging every ingress request.

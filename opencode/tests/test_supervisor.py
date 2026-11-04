@@ -274,9 +274,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
-    def test_manifest_enables_core_api_for_version_0_0_4(self):
+    def test_manifest_enables_core_api_for_version_0_0_5(self):
         manifest = yaml.safe_load((Path(__file__).resolve().parents[1] / "config.yaml").read_text())
-        self.assertEqual(manifest["version"], "0.0.4")
+        self.assertEqual(manifest["version"], "0.0.5")
         self.assertTrue(manifest["hassio_api"])
         self.assertEqual(manifest["hassio_role"], "admin")
         self.assertTrue(manifest["homeassistant_api"])
