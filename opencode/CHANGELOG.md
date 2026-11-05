@@ -1,5 +1,31 @@
 # Changes
 
+## 0.0.13
+
+- Mark the app as experimental.
+- Configure the built-in LiteLLM provider with a fixed URL and no authentication.
+
+## 0.0.12
+
+- Route Markdown worker scripts through the current Home Assistant ingress path.
+
+## 0.0.11
+
+- Send OpenCode UI API requests with their original body on HTTP/1.1.
+- Send the Home Assistant ingress session cookie with same-origin API requests.
+
+## 0.0.10
+
+- Add the current ingress path to OpenCode UI requests and navigation.
+- Check the two OpenCode 2.2.5 UI bundles before the gateway adapts them.
+- Disable service worker registration inside ingress.
+
+## 0.0.8
+
+- Forward OpenCode v2 UI requests to each user's server.
+- Rewrite HTML links and app redirects with the current ingress path.
+- Keep non-HTML transfers and WebSocket traffic streaming.
+
 ## 0.0.5
 
 - Install tools through mise when the container starts.

@@ -1,7 +1,8 @@
 name: OpenCode
-version: "0.0.7"
+version: "0.0.13"
 slug: opencode
 description: Run one OpenCode instance for each Home Assistant user.
+stage: experimental
 url: https://github.com/T4cC0re/HomeAssistant-Apps/tree/main/opencode
 arch:
   - amd64

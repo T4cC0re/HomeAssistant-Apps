@@ -10,7 +10,7 @@ litellm_discovery: true
 | Option | Default | Function |
 | --- | --- | --- |
 | `lazy_start` | `true` | Start a user's server on the first valid ingress request. If `false`, start all users in the database when the app starts. |
-| `litellm_discovery` | `true` | Read the LiteLLM connection data and add an OpenCode provider. If `false`, do not add this provider. |
+| `litellm_discovery` | `true` | Read the LiteLLM model list. If `false`, use the fixed provider without discovered models. |
 
 The app checks whether LiteLLM is installed for both settings. If LiteLLM
 is absent, the app logs a warning and continues. OpenCode can use other
@@ -72,7 +72,7 @@ with numeric user ID `10000 + id` and group `0`. It does not pass the
 Supervisor token or the parent environment to the process.
 
 The gateway detects the public URL and ingress prefix from each trusted
-request. It uses them to serve the web interface and forward that request.
+request. It uses them to forward that request.
 A new session cookie, URL, or prefix does not restart a live server.
 The server receives the URL and prefix from its first start, including empty
 values when `lazy_start` is `false`. If the server stops, the next request
@@ -101,8 +101,8 @@ configuration.
 You can keep an OpenCode configuration at
 `/data/<username>/.config/opencode/opencode.json`. The app supplies its
 server and LiteLLM settings through `OPENCODE_CONFIG_CONTENT`, which
-OpenCode applies after file configuration. Set `litellm_discovery: false`
-if you want to manage that provider yourself.
+OpenCode applies after file configuration. The app always sets its LiteLLM
+provider URL and name. Set `litellm_discovery: false` to skip model discovery.
 
 ## LiteLLM and discovery
 
@@ -128,11 +128,13 @@ paths. If all calls fail, OpenCode starts without the LiteLLM provider.
 The app does not read LiteLLM options. It still checks whether LiteLLM is
 installed and logs a warning when it is absent.
 
-The provider uses `@ai-sdk/openai-compatible`. Its URL uses the published
-host, port, and API path. Its key uses `master_key`. The app reads the
-LiteLLM `/models` response to fill the OpenCode model list. If that request
-fails, the app logs a warning. You can supply `provider.litellm.models` in
-your OpenCode configuration or restart the app after LiteLLM is ready.
+The provider uses `@ai-sdk/openai-compatible`, the name
+`homeassistant-litellm`, and the URL
+`http://aca25ede-litellm:4000/inference/v1`. OpenCode receives no API key
+for this provider. The app can still use discovered LiteLLM credentials to
+read `/models` and fill the model list. If that request fails, the app logs
+a warning. You can supply `provider.litellm.models` in your OpenCode
+configuration or restart the app after LiteLLM is ready.
 
 ## Watchdog
 
@@ -149,10 +151,27 @@ after it has sent a request, the app warns until you restart it.
 
 ## Web interface
 
-The Docker build uses OpenCode 2.2.5 for the server and the OpenCode 1.19.5
-source for the web interface. Compatibility between these versions has not
-been checked. `prepare_frontend.py` adds the ingress prefix to the web
-interface's router and API URL. It stops the build if the expected source
-code changes. `frontend.py` supplies the current prefix when it serves the
-HTML page. This keeps assets, navigation, HTTP requests, events, and
-terminal WebSockets under Home Assistant ingress.
+OpenCode v2 serves its own web interface. The gateway removes the Home
+Assistant ingress prefix from each request path and forwards the request
+to the user's OpenCode server. For each HTML response, it adds a base URL
+and the current `X-Ingress-Path` value to root-relative links. It adds a
+same-origin script before OpenCode's module script. This script adds the
+current ingress path to unprefixed `fetch`, XHR, EventSource, WebSocket, and
+Worker URLs, and to dynamic asset links. It adjusts font URLs in loaded style
+sheets. The gateway also adapts the two pinned OpenCode 2.2.5 UI bundles
+in transit. The adapter gives the router the current ingress base, removes
+the prefix before OpenCode parses its route, and skips service worker
+registration. It also keeps the original body when the request queue sends
+an API request. This lets JSON requests work on an HTTP/1.1 connection.
+The script sends the ingress session cookie with same-origin app requests.
+It does not add that cookie to external requests. The adapter checks each
+bundle's name, SHA-256 hash, and replacement count. If a bundle changes,
+the gateway returns HTTP `502` with an error.
+
+The gateway rewrites app redirects to the current ingress path. It gets
+the path from each authenticated request. A new ingress URL does not
+restart a user's server. The script derives its path from the page's base
+tag. It does not contain a session token. Changed HTML and JavaScript
+responses are not cached. Other assets, uploads, events, and WebSockets
+continue to stream through the gateway. The OpenCode binary and source
+files are not changed.

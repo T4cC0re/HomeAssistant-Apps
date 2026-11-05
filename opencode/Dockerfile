@@ -18,19 +18,18 @@ ENV MISE_DATA_DIR=/opt/mise \
 
 WORKDIR /opt/opencode-addon
 COPY docker.mise.toml /etc/mise/config.toml
+COPY mise.toml /opt/opencode-addon/mise.toml
 COPY requirements.txt /opt/opencode-addon/requirements.txt
 # This will install to a shared directory, which the startup will also do
 # so we install, pip install the venv, then drop python again
 RUN mkdir -p ${MISE_SHARED_INSTALL_DIRS} /opt/opencode-addon /opt/mise \
     && mise bootstrap \
-    && mise install --shared ${MISE_SHARED_INSTALL_DIRS} \
-    && mise x -- pip install -r requirements.txt 
+    && mise x -- pip install -r requirements.txt
 #    && rm -rf ${MISE_SHARED_INSTALL_DIRS} /opt/mise
 
 # We copy this after, so that we dont have this in the container
 # the tools will be stored in `/data/mise`, and can be reused by
 # future incarnations as long as the version of the tool is the same.
-COPY mise.toml /opt/opencode-addon/mise.toml
 
 LABEL io.hass.name="OpenCode" \
       io.hass.description="Run multi-tenanot OpenCode (instance for each Home Assistant user)" \

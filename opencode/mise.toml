@@ -14,7 +14,7 @@ npm = "12.2.1"
 description = "Start the OpenCode instance for one user."
 dir = "{{ env.HOME }}"
 run = 'exec opencode serve --hostname 127.0.0.1 --port "$OPENCODE_PORT" --print-logs'
-quiet = true
+quiet = false
 deny_env = true
 allow_env = [
   "OPENCODE_USERNAME",
@@ -29,6 +29,8 @@ allow_env = [
   "XDG_DATA_HOME",
   "XDG_CACHE_HOME",
   "XDG_STATE_HOME",
+  "MISE_*",
+  "LITELLM_*",
   "TMPDIR",
 ]
 

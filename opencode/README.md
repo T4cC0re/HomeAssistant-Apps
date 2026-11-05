@@ -16,9 +16,8 @@ Home Assistant. Select **OpenCode**, then select **Install**.
 For a local installation, copy the contents of this folder to
 `/addons/local/opencode`. Keep `config.yaml` and `Dockerfile` directly in
 that folder. In the app store, select **Check for updates**, then install
-**OpenCode** from the local apps list. The first build downloads the tools
-and builds the web interface. It needs internet access and several GB of
-free space.
+**OpenCode** from the local apps list. The first build downloads the tools.
+It needs internet access and several GB of free space.
 
 Start the app, then select **Open Web UI**. See [DOCS.md](DOCS.md) for the
 options, storage paths, and Supervisor API limits.
@@ -32,20 +31,6 @@ folder, run:
 python -m unittest discover -s tests -v
 ```
 
-A browser request test also uses Node.js when it is available. The image
-uses the Python version and dependencies set in the Dockerfile and
-`mise.toml`.
-
-To check a built web interface against the pinned OpenCode server in a
-browser, install Playwright in a separate test directory, then run:
-
-```sh
-python tests/browser_smoke.py \
-  --web-dir /path/to/packages/app/dist \
-  --opencode /path/to/opencode \
-  --playwright /path/to/playwright/index.mjs \
-  --browser /path/to/chrome
-```
-
-This check starts a temporary backend and gateway. It checks navigation,
-API paths, assets, and the event stream through an ingress prefix.
+The tests check ingress authentication, proxy transfers, the OpenCode v2
+UI adapter, HTTP/1.1 API requests, and process reuse. The image uses the
+Python version and dependencies set in the Dockerfile and `mise.toml`.

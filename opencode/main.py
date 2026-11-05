@@ -18,12 +18,15 @@ from aiohttp import web, WSMsgType
 from multidict import CIMultiDict
 from yarl import URL
 
-from frontend import transform_html
+from frontend import (INGRESS_SCRIPT, MAX_HTML_BYTES, MAX_SCRIPT_BYTES, SHIM_PATH,
+                      adapt_bundle, is_bundle_candidate, rewrite_html, rewrite_location)
 from supervisor import Supervisor, SupervisorCoreOnly, SupervisorError
 
 
 LOG = logging.getLogger("opencode")
 PORT = 8080
+LITELLM_BASE_URL = "http://aca25ede-litellm:4000/inference/v1"
+LITELLM_PROVIDER_NAME = "homeassistant-litellm"
 USER_UID_BASE = 10000
 APP_DIR = Path(__file__).resolve().parent
 TRUSTED_INGRESS = ipaddress.ip_address("172.30.32.2")
@@ -199,6 +202,12 @@ class Instances:
     def environment(self, user_id: int, username: str, home: Path,
                     prefix: str, origin: str, password: str) -> dict[str, str]:
         config = json.loads(json.dumps(self.overlay))
+        provider = config.setdefault("provider", {}).setdefault("litellm", {})
+        provider.update({
+            "npm": "@ai-sdk/openai-compatible",
+            "name": LITELLM_PROVIDER_NAME,
+            "options": {"baseURL": LITELLM_BASE_URL},
+        })
         config["server"] = {"hostname": "127.0.0.1", "port": PORT + user_id,
                             "cors": [origin] if origin else []}
         return {
@@ -321,10 +330,8 @@ def ingress_context(request: web.Request) -> tuple[str, str, str, str]:
 def proxy_headers(headers, *, response=False) -> CIMultiDict:
     connection = {part.strip().lower() for part in headers.get("Connection", "").split(",")}
     blocked = HOP_HEADERS | connection
-    if response:
-        blocked |= {"set-cookie", "www-authenticate"}
-    else:
-        blocked |= PRIVATE_HEADERS | {"accept-encoding", "content-length"}
+    if not response:
+        blocked |= PRIVATE_HEADERS | {"content-length"}
     result = CIMultiDict()
     for name, value in headers.items():
         lower = name.lower()
@@ -338,11 +345,10 @@ class Gateway:
     """Validate ingress requests and stream them to each user's server."""
 
     def __init__(self, supervisor: Supervisor, instances: Instances,
-                 client: aiohttp.ClientSession, web_dir: Path = APP_DIR / "web"):
+                 client: aiohttp.ClientSession):
         self.supervisor = supervisor
         self.instances = instances
         self.client = client
-        self.web_dir = web_dir
         self.warned_core_only = False
 
     async def validate(self, session: str):
@@ -361,6 +367,18 @@ class Gateway:
     async def handle(self, request: web.Request) -> web.StreamResponse:
         username, prefix, origin, session = ingress_context(request)
         await self.validate(session)
+        raw_path = request.rel_url.raw_path
+        if raw_path == prefix:
+            raw_path = "/"
+        elif raw_path.startswith(prefix + "/"):
+            raw_path = raw_path[len(prefix):]
+        if raw_path == SHIM_PATH:
+            if request.method not in {"GET", "HEAD"}:
+                raise web.HTTPMethodNotAllowed(request.method, ["GET", "HEAD"])
+            return web.Response(
+                body=INGRESS_SCRIPT, content_type="text/javascript", charset="utf-8",
+                headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+            )
         user_id, username = self.instances.store.upsert(username)
         self.instances.seen_users[username] = user_id
         try:
@@ -368,41 +386,22 @@ class Gateway:
         except (OSError, ValueError, RuntimeError):
             LOG.exception("Cannot start OpenCode for user %s.", username)
             raise web.HTTPServiceUnavailable(text="Cannot start OpenCode. Check the app log and sandbox support.") from None
-        raw_path = request.rel_url.raw_path
-        if raw_path == prefix:
-            raise web.HTTPPermanentRedirect(location=prefix + "/")
-        if raw_path.startswith(prefix + "/"):
-            raw_path = raw_path[len(prefix):]
         if request.rel_url.raw_query_string:
             raw_path += "?" + request.rel_url.raw_query_string
         target = URL(f"http://127.0.0.1:{instance.port}" + raw_path, encoded=True)
         headers = proxy_headers(request.headers)
-        headers["Accept-Encoding"] = "identity"
         headers["Authorization"] = aiohttp.encode_basic_auth("opencode", instance.password)
         headers["X-Forwarded-Prefix"] = prefix
         headers["X-Forwarded-Proto"] = urlsplit(origin).scheme
         headers["X-Forwarded-Host"] = urlsplit(origin).netloc
         if request.headers.get("Upgrade", "").lower() == "websocket":
             return await self.websocket(request, target, headers, instance, session)
-        if request.method in {"GET", "HEAD"}:
-            local = self.static_response(request, raw_path.split("?", 1)[0], prefix, origin)
-            if local is not None:
-                return local
+        headers["Accept-Encoding"] = "identity"
+        if ("text/html" in request.headers.get("Accept", "").lower()
+                or is_bundle_candidate(target.raw_path.split("?", 1)[0])):
+            for name in ("If-None-Match", "If-Modified-Since", "If-Range", "Range"):
+                headers.popall(name, None)
         return await self.http(request, target, headers, instance, prefix, origin)
-
-    def static_response(self, request: web.Request, path: str, prefix: str, origin: str):
-        relative = path.lstrip("/")
-        candidate = (self.web_dir / relative).resolve()
-        if candidate.is_relative_to(self.web_dir.resolve()) and candidate.is_file():
-            if candidate.name != "index.html":
-                return web.FileResponse(candidate, headers={"Cache-Control": "no-cache"})
-        elif "text/html" not in request.headers.get("Accept", "") and path not in {"/", "/index.html"}:
-            return None
-        index = self.web_dir / "index.html"
-        if not index.is_file():
-            raise web.HTTPServiceUnavailable(text="The OpenCode web interface is missing from the image.")
-        return web.Response(body=transform_html(index.read_bytes(), prefix, origin + prefix),
-                            content_type="text/html", headers={"Cache-Control": "no-store"})
 
     async def http(self, request, target, headers, instance, prefix, origin):
         response = None
@@ -416,11 +415,42 @@ class Gateway:
                 outgoing = proxy_headers(upstream.headers, response=True)
                 location = outgoing.get("Location")
                 if location:
-                    internal = f"http://127.0.0.1:{instance.port}"
-                    if location.startswith(internal + "/"):
-                        outgoing["Location"] = origin + prefix + location[len(internal):]
-                    elif location.startswith("/") and not location.startswith("//"):
-                        outgoing["Location"] = prefix + location
+                    outgoing["Location"] = rewrite_location(location, prefix, origin, instance.port)
+                bundle_path = target.raw_path.split("?", 1)[0]
+                if is_bundle_candidate(bundle_path) and request.method == "GET":
+                    encoding = upstream.headers.get("Content-Encoding", "").lower()
+                    if upstream.status != 200 or encoding not in {"", "identity"}:
+                        raise web.HTTPBadGateway(text="OpenCode sent a UI bundle that cannot be adapted.")
+                    body = bytearray()
+                    async for chunk in upstream.content.iter_chunked(64 * 1024):
+                        body.extend(chunk)
+                        if len(body) > MAX_SCRIPT_BYTES:
+                            raise web.HTTPBadGateway(text="The OpenCode UI bundle is too large.")
+                    try:
+                        rewritten = adapt_bundle(bundle_path, bytes(body))
+                    except ValueError as error:
+                        LOG.error("OpenCode UI adapter rejected %s: %s", bundle_path, error)
+                        raise web.HTTPBadGateway(text=str(error)) from None
+                    self.changed_headers(outgoing)
+                    return web.Response(body=rewritten, status=upstream.status, headers=outgoing)
+                if (upstream.content_type == "text/html" and request.method != "HEAD"
+                        and upstream.status not in {204, 304}):
+                    encoding = upstream.headers.get("Content-Encoding", "").lower()
+                    if encoding not in {"", "identity"} or upstream.status == 206:
+                        raise web.HTTPBadGateway(text="OpenCode sent HTML that cannot be rewritten.")
+                    if upstream.charset and upstream.charset.lower() != "utf-8":
+                        raise web.HTTPBadGateway(text="OpenCode sent HTML with an unsupported character set.")
+                    body = bytearray()
+                    async for chunk in upstream.content.iter_chunked(64 * 1024):
+                        body.extend(chunk)
+                        if len(body) > MAX_HTML_BYTES:
+                            raise web.HTTPBadGateway(text="The OpenCode HTML document is too large.")
+                    try:
+                        rewritten = rewrite_html(bytes(body), prefix)
+                    except (UnicodeDecodeError, ValueError) as error:
+                        raise web.HTTPBadGateway(text=str(error)) from None
+                    self.changed_headers(outgoing)
+                    return web.Response(body=rewritten, status=upstream.status, headers=outgoing)
                 response = web.StreamResponse(status=upstream.status, headers=outgoing)
                 await response.prepare(request)
                 async for chunk in upstream.content.iter_chunked(256 * 1024):
@@ -433,6 +463,14 @@ class Gateway:
                     request.transport.close()
                 return response
             raise web.HTTPBadGateway(text="The OpenCode server connection failed.") from None
+
+    @staticmethod
+    def changed_headers(headers):
+        for name in ("Content-Length", "Content-Encoding", "ETag", "Last-Modified",
+                     "Content-MD5", "Content-Digest", "Repr-Digest", "Digest",
+                     "Accept-Ranges", "Expires"):
+            headers.popall(name, None)
+        headers["Cache-Control"] = "private, no-store"
 
     async def websocket(self, request, target, headers, instance, session):
         protocols = [part.strip() for part in request.headers.get("Sec-WebSocket-Protocol", "").split(",") if part.strip()]
