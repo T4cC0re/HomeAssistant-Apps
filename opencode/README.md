@@ -34,3 +34,13 @@ python -m unittest discover -s tests -v
 The tests check ingress authentication, proxy transfers, the OpenCode v2
 UI adapter, HTTP/1.1 API requests, and process reuse. The image uses the
 Python version and dependencies set in the Dockerfile and `mise.toml`.
+
+To check sandbox enforcement, run the tests inside the installed Linux app
+with `OPENCODE_SANDBOX_INTEGRATION=1`. This check needs the app's AppArmor
+profile and `SYS_ADMIN` capability. It creates a temporary home below
+`/data`, checks isolation in a child process, then removes the home.
+
+To check mount setup in a Linux test container with `SYS_ADMIN`, set
+`OPENCODE_SANDBOX_MOUNT_TESTS=1`. This test checks the home bind mount,
+hidden paths, and read-only system mounts. It also checks that the parent
+process keeps its original mounts. It does not test AppArmor enforcement.

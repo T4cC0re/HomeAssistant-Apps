@@ -1,4 +1,4 @@
-"""Read Supervisor data and check ingress sessions."""
+"""Read LiteLLM app settings and check ingress sessions."""
 
 import json
 import logging
@@ -8,10 +8,6 @@ import aiohttp
 
 
 LOGGER = logging.getLogger(__name__)
-CORE_ONLY_ENDPOINTS = {"/discovery", "/ingress/validate_session"}
-PUBLIC_DISCOVERY_FIELDS = {"host", "port", "path", "ssl", "protocol"}
-CORE_PROXY_URL = "http://192.168.178.147:8123"
-HOMEASSISTANT_URL = "http://homeassistant"
 
 
 class SupervisorError(RuntimeError):
@@ -30,102 +26,49 @@ class SupervisorInvalidSession(SupervisorError):
     """The ingress session is not valid."""
 
 
-def redact_discovery(data: dict) -> dict:
-    """Remove private configuration values from a discovery log record."""
-    result = dict(data)
-    messages = data.get("discovery")
-    if isinstance(messages, list):
-        result["discovery"] = []
-        for message in messages:
-            if not isinstance(message, dict):
-                result["discovery"].append("[redacted]")
-                continue
-            safe = {key: value for key, value in message.items() if key in {"addon", "app", "service", "uuid"}}
-            config = message.get("config")
-            if isinstance(config, dict):
-                safe["config"] = {
-                    key: value if key in PUBLIC_DISCOVERY_FIELDS and isinstance(value, (str, int, bool)) else "[redacted]"
-                    for key, value in config.items()
-                }
-            result["discovery"].append(safe)
-    return {key: value for key, value in result.items() if key in {"discovery", "services"}}
-
-
-def litellm_overlay(config: dict) -> dict:
-    """Convert the LiteLLM discovery fields to an OpenCode provider."""
-    host, port = config.get("host"), config.get("port")
-    path, key = config.get("path", ""), config.get("master_key")
+def litellm_connection(info: dict) -> dict:
+    """Get the connection from the installed LiteLLM app information."""
+    host = info.get("hostname")
+    options = info.get("options")
     if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", host):
         raise SupervisorError("LiteLLM has an invalid host name.")
-    if type(port) is not int or not 1 <= port <= 65535:
-        raise SupervisorError("LiteLLM has an invalid port.")
+    if not isinstance(options, dict):
+        raise SupervisorError("LiteLLM has no app options.")
+    path, key = options.get("server_root_path"), options.get("master_key")
     if not isinstance(path, str) or not re.fullmatch(r"(?:/[A-Za-z0-9._~/-]*)?", path):
         raise SupervisorError("LiteLLM has an invalid API path.")
-    if any(part in {".", ".."} for part in path.split("/")):
+    if any(part in {".", ".."} for part in path.split("/")) or (len(path) > 1 and path.endswith("/")):
         raise SupervisorError("LiteLLM has an invalid API path.")
-    if not isinstance(key, str) or not key.strip() or key.startswith("!secret"):
+    if not isinstance(key, str) or not key.strip() or key.startswith(("!secret", "os.environ/")):
         raise SupervisorError("LiteLLM has no usable master key.")
-    base_url = f"http://{host}:{port}{path.rstrip('/') or '/v1'}"
-    return {
-        "provider": {
-            "litellm": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "LiteLLM",
-                "options": {"baseURL": base_url, "apiKey": key},
-                "models": {},
-            }
-        }
-    }
+    return {"base_url": f"http://{host}:4000{path}", "master_key": key}
 
 
 class Supervisor:
     """Use a caller-owned HTTP session to read the Supervisor API."""
 
-    def __init__(self, session: aiohttp.ClientSession, token: str, base_url: str = "http://supervisor",
-                 core_proxy_url: str = CORE_PROXY_URL, homeassistant_url: str = HOMEASSISTANT_URL):
+    def __init__(self, session: aiohttp.ClientSession, token: str, base_url: str = "http://supervisor"):
         if not isinstance(token, str) or not token:
             raise SupervisorError("SUPERVISOR_TOKEN is required.")
         self.session = session
         self.token = token
         self.base_url = base_url.rstrip("/")
-        self.core_proxy_url = core_proxy_url.rstrip("/")
-        self.homeassistant_url = homeassistant_url.rstrip("/")
-        self.info: dict = {}
+        self.api_verified = False
 
-    def _safe_probe_body(self, body: str) -> str:
-        """Keep the app token out of a response body log."""
-        return body.replace(self.token, "[redacted SUPERVISOR_TOKEN]")
-
-    async def request(self, method: str, path: str, payload: dict | None = None,
-                      log_response: bool = False) -> dict:
-        """Send an authenticated request and log the body only when asked."""
+    async def request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        """Send an authenticated request without logging response data."""
         try:
             async with self.session.request(
-                method,
-                self.base_url + path,
-                json=payload,
+                method, self.base_url + path, json=payload,
                 headers={"Authorization": f"Bearer {self.token}", "Accept-Encoding": "identity"},
-                timeout=aiohttp.ClientTimeout(total=10),
-                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=10), allow_redirects=False,
             ) as response:
-                body = await response.text()
-                status = response.status
-                content_type = response.content_type
+                body, status, content_type = await response.text(), response.status, response.content_type
         except (aiohttp.ClientError, TimeoutError, UnicodeError):
-            if log_response:
-                LOGGER.warning("Supervisor %s could not be reached.", path)
             raise SupervisorError(f"The Supervisor request to {path} failed.") from None
-        if log_response:
-            LOGGER.info("Supervisor %s HTTP %s: %s", path, status, self._safe_probe_body(body))
-        if (
-            path in CORE_ONLY_ENDPOINTS
-            and self.info.get("hassio_role") == "admin"
-            and self.info.get("hassio_api") is True
-            and status == 401
-            and content_type == "text/plain"
-            and body.strip() == "401: Unauthorized"
-        ):
-            raise SupervisorCoreOnly(f"Only Home Assistant Core can use {path}.")
+        if (path == "/ingress/validate_session" and self.api_verified and content_type == "text/plain"
+                and (status, body.strip()) in {(401, "401: Unauthorized"), (403, "403: Forbidden")}):
+            raise SupervisorCoreOnly("Only Home Assistant Core can use the session check.")
         if status == 403:
             raise SupervisorForbidden(f"The Supervisor denied {path} (HTTP 403).")
         try:
@@ -143,174 +86,34 @@ class Supervisor:
             raise SupervisorError(f"The Supervisor returned invalid data for {path}.")
         return data
 
-    async def self_info(self) -> dict:
-        """Read the app information and retain proof of API access."""
-        self.info = await self.request("GET", "/addons/self/info", log_response=True)
-        return self.info
-
-    async def probe_url(self, url: str) -> dict | None:
-        """Log one probe response and return valid discovery data."""
-        try:
-            async with self.session.get(
-                url,
-                headers={"Authorization": f"Bearer {self.token}", "Accept-Encoding": "identity"},
-                timeout=aiohttp.ClientTimeout(total=5),
-                allow_redirects=False,
-            ) as response:
-                status = response.status
-                body = await response.text()
-        except (aiohttp.ClientError, TimeoutError, UnicodeError) as error:
-            LOGGER.warning("Probe %s could not be reached: %s", url, type(error).__name__)
-            return None
-        LOGGER.info("Probe %s HTTP %s: %s", url, status, self._safe_probe_body(body))
-        if status != 200:
-            return None
-        try:
-            payload = json.loads(body)
-        except ValueError:
-            return None
-        if not isinstance(payload, dict) or payload.get("result") != "ok":
-            return None
-        data = payload.get("data")
-        if isinstance(data, dict) and isinstance(data.get("discovery"), list):
-            return data
-        return None
-
     async def validate_session(self, token: str) -> bool:
         """Check a session, or report a known Core-only API restriction."""
         if not token:
             return False
         try:
             await self.request("POST", "/ingress/validate_session", {"session": token})
-        except SupervisorCoreOnly:
-            raise
         except SupervisorInvalidSession:
             return False
         return True
 
-    async def probe_core_proxy(self) -> dict | None:
-        """Try the requested Core proxy paths with this app's token."""
-        for path in ("discover", "discovery"):
-            try:
-                async with self.session.get(
-                    f"{self.core_proxy_url}/api/hassio/{path}",
-                    headers={"Authorization": f"Bearer {self.token}", "Accept-Encoding": "identity"},
-                    timeout=aiohttp.ClientTimeout(total=5),
-                    allow_redirects=False,
-                ) as response:
-                    status = response.status
-                    body = await response.text()
-                    content_type = response.content_type
-            except (aiohttp.ClientError, TimeoutError, UnicodeError):
-                LOGGER.warning("Core proxy /api/hassio/%s could not be reached.", path)
-                continue
-            data = None
-            payload = None
-            if content_type == "application/json":
-                try:
-                    payload = json.loads(body)
-                except ValueError:
-                    pass
-            if status == 200 and isinstance(payload, dict):
-                if payload.get("result") == "ok":
-                    candidate = payload.get("data")
-                    if isinstance(candidate, dict) and isinstance(candidate.get("discovery"), list):
-                        data = candidate
-            if data is not None:
-                LOGGER.info("Core proxy /api/hassio/%s HTTP %s: %s", path, status,
-                            json.dumps(redact_discovery(data), sort_keys=True))
-                return data
-            summary = {"body": "[redacted]"}
-            if isinstance(payload, dict):
-                result = payload.get("result")
-                summary = {"result": result if isinstance(result, str) and result in {"ok", "error"} else "[redacted]"}
-                if "message" in payload:
-                    summary["message"] = "[redacted]"
-            LOGGER.warning("Core proxy /api/hassio/%s returned HTTP %s: %s", path, status,
-                           json.dumps(summary, sort_keys=True))
-        return None
-
     async def startup(self, litellm_discovery: bool = True) -> dict:
-        """Log discovery data, check LiteLLM, and return its provider config."""
+        """Read the installed LiteLLM app settings when enabled."""
         try:
-            await self.self_info()
+            addons = await self.request("GET", "/addons")
+            self.api_verified = True
+            installed = addons.get("addons")
+            if not isinstance(installed, list):
+                raise SupervisorError("The Supervisor returned an invalid installed app list.")
+            if not litellm_discovery:
+                return {}
+            matches = [addon["slug"] for addon in installed if isinstance(addon, dict)
+                       and isinstance(addon.get("slug"), str)
+                       and re.fullmatch(r"(?:[a-zA-Z0-9]+_)?litellm", addon["slug"])]
+            if len(matches) != 1:
+                LOGGER.warning("Expected one installed LiteLLM app; found %s.", len(matches))
+                return {}
+            info = await self.request("GET", f"/addons/{matches[0]}/info")
+            return litellm_connection(info)
         except SupervisorError as error:
-            LOGGER.warning("Cannot read Supervisor app information: %s", error)
-        await self.probe_url(self.base_url + "/info")
-        probe_discovery = await self.probe_url(self.base_url + "/core/api/hassio/discovery")
-        candidate = await self.probe_url(self.homeassistant_url + "/api/hassio/discover")
-        if probe_discovery is None:
-            probe_discovery = candidate
-        discovery = None
-        try:
-            discovery = await self.request("GET", "/discovery")
-            LOGGER.info("Supervisor /discovery: %s", json.dumps(redact_discovery(discovery), sort_keys=True))
-        except SupervisorError as error:
-            LOGGER.warning("Cannot read Supervisor /discovery: %s", error)
-            discovery = probe_discovery or await self.probe_core_proxy()
-        addons = await self.request("GET", "/addons")
-        installed = addons.get("addons")
-        if not isinstance(installed, list):
-            raise SupervisorError("The Supervisor returned an invalid installed app list.")
-        matches = [
-            addon for addon in installed
-            if isinstance(addon, dict) and isinstance(addon.get("slug"), str)
-            and (addon["slug"] == "litellm" or addon["slug"].endswith("_litellm"))
-        ]
-        if not matches:
-            LOGGER.warning("The LiteLLM app is not installed.")
+            LOGGER.warning("Cannot configure LiteLLM: %s", error)
             return {}
-        if not litellm_discovery:
-            return {}
-        config = self._discovered_config(discovery, matches)
-        if config is None:
-            LOGGER.warning("No running LiteLLM discovery record is available.")
-            return {}
-        try:
-            overlay = litellm_overlay(config)
-        except SupervisorError as error:
-            LOGGER.warning("Cannot configure the LiteLLM provider: %s", error)
-            return {}
-        await self._add_models(overlay)
-        return overlay
-
-    @staticmethod
-    def _discovered_config(discovery: dict | None, installed: list[dict]) -> dict | None:
-        if discovery is None:
-            return None
-        messages = discovery.get("discovery")
-        if not isinstance(messages, list):
-            LOGGER.warning("The Supervisor discovery record list is invalid.")
-            return None
-        slugs = {addon["slug"] for addon in installed}
-        for message in messages:
-            if not isinstance(message, dict) or message.get("service") != "litellm":
-                continue
-            if message.get("addon", message.get("app")) not in slugs:
-                continue
-            if isinstance(message.get("config"), dict):
-                return message["config"]
-        return None
-
-    async def _add_models(self, overlay: dict) -> None:
-        provider = overlay["provider"]["litellm"]
-        options = provider["options"]
-        try:
-            async with self.session.get(
-                options["baseURL"] + "/models",
-                headers={"Authorization": f"Bearer {options['apiKey']}", "Accept-Encoding": "identity"},
-                timeout=aiohttp.ClientTimeout(total=10),
-                allow_redirects=False,
-            ) as response:
-                response.raise_for_status()
-                result = await response.json()
-            models = result.get("data") if isinstance(result, dict) else None
-            if not isinstance(models, list):
-                raise ValueError
-            provider["models"] = {
-                model["id"]: {"name": model["id"]}
-                for model in models
-                if isinstance(model, dict) and isinstance(model.get("id"), str) and model["id"]
-            }
-        except (aiohttp.ClientError, TimeoutError, ValueError, UnicodeError):
-            LOGGER.warning("Cannot read the LiteLLM model list. Set provider.litellm.models in the OpenCode configuration.")

@@ -11,6 +11,7 @@ import re
 import secrets
 import signal
 import sqlite3
+import sys
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -25,8 +26,6 @@ from supervisor import Supervisor, SupervisorCoreOnly, SupervisorError
 
 LOG = logging.getLogger("opencode")
 PORT = 8080
-LITELLM_BASE_URL = "http://aca25ede-litellm:4000/inference/v1"
-LITELLM_PROVIDER_NAME = "homeassistant-litellm"
 USER_UID_BASE = 10000
 APP_DIR = Path(__file__).resolve().parent
 TRUSTED_INGRESS = ipaddress.ip_address("172.30.32.2")
@@ -199,21 +198,24 @@ class Instances:
             os.close(data_fd)
         return home
 
-    def environment(self, user_id: int, username: str, home: Path,
-                    prefix: str, origin: str, password: str) -> dict[str, str]:
-        config = json.loads(json.dumps(self.overlay))
-        provider = config.setdefault("provider", {}).setdefault("litellm", {})
-        provider.update({
-            "npm": "@ai-sdk/openai-compatible",
-            "name": LITELLM_PROVIDER_NAME,
-            "options": {"baseURL": LITELLM_BASE_URL},
-        })
+    def environment(self, user_id: int, username: str, prefix: str,
+                    origin: str, password: str) -> dict[str, str]:
+        home = Path("/home/opencode")
+        config = {}
+        if self.overlay:
+            config["plugins"] = ["opencode-plugin-litellm@1.10.0"]
+            config["providers"] = {"litellm": {
+                "name": "LiteLLM", "package": "@opencode/ai/providers/openai-compatible",
+                "settings": {"baseURL": self.overlay["base_url"], "apiKey": "{env:LITELLM_MASTER_KEY}"},
+            }}
         config["server"] = {"hostname": "127.0.0.1", "port": PORT + user_id,
                             "cors": [origin] if origin else []}
-        return {
+        env = {key: value for key, value in os.environ.items()
+               if key not in {"SUPERVISOR_TOKEN", "HASSIO_TOKEN"}}
+        env.update({
             "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",
             "HOME": str(home), "USER": username, "SHELL": "/bin/sh",
-            "MISE_DATA_DIR": "/opt/mise", "MISE_CONFIG_DIR": "/opt/mise-config",
+            "MISE_DATA_DIR": "/opt/mise", "MISE_CONFIG_DIR": "/etc/mise",
             "MISE_CACHE_DIR": str(home / ".cache/mise"),
             "MISE_STATE_DIR": str(home / ".local/state/mise"),
             "MISE_TRUSTED_CONFIG_PATHS": str(self.app_dir),
@@ -230,7 +232,11 @@ class Instances:
             "OPENCODE_SERVER_USERNAME": "opencode",
             "OPENCODE_SERVER_PASSWORD": password,
             "OPENCODE_DISABLE_AUTOUPDATE": "true",
-        }
+        })
+        if self.overlay:
+            env["LITELLM_BASE_URL"] = self.overlay["base_url"]
+            env["LITELLM_MASTER_KEY"] = self.overlay["master_key"]
+        return env
 
     async def ensure(self, user_id: int, username: str, prefix: str, origin: str) -> Instance:
         if not 0 < user_id <= 65535 - PORT:
@@ -241,13 +247,11 @@ class Instances:
                 return old
             home = self.home(user_id, username)
             password = secrets.token_urlsafe(32)
-            kwargs = {}
-            if os.geteuid() == 0:
-                kwargs = {"user": USER_UID_BASE + user_id, "group": 0, "extra_groups": []}
             process = await asyncio.create_subprocess_exec(
-                "mise", "-C", str(self.app_dir), "run", "opencode",
-                cwd=home, env=self.environment(user_id, username, home, prefix, origin, password),
-                start_new_session=True, **kwargs,
+                sys.executable, "-I", str(self.app_dir / "sandbox.py"),
+                "--home", str(home), "--uid", str(USER_UID_BASE + user_id),
+                cwd="/", env=self.environment(user_id, username, prefix, origin, password),
+                start_new_session=True,
             )
             instance = Instance(user_id, username, process, password)
             self.running[user_id] = instance
@@ -341,6 +345,26 @@ def proxy_headers(headers, *, response=False) -> CIMultiDict:
     return result
 
 
+def check_browser_origin(headers, public_origin: str) -> bool:
+    """Accept a browser origin only when it matches the current ingress URL."""
+    origins = headers.getall("Origin", [])
+    if not origins:
+        return False
+    try:
+        if (len(origins) != 1 or "?" in origins[0] or "#" in origins[0]
+                or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in origins[0])):
+            raise ValueError
+        parsed = urlsplit(origins[0])
+        if (parsed.scheme not in {"http", "https"}
+                or parsed.username is not None or parsed.password is not None
+                or parsed.path or parsed.query or parsed.fragment
+                or str(URL(origins[0]).origin()) != str(URL(public_origin).origin())):
+            raise ValueError
+    except ValueError:
+        raise web.HTTPForbidden(text="The browser origin does not match Home Assistant.") from None
+    return True
+
+
 class Gateway:
     """Validate ingress requests and stream them to each user's server."""
 
@@ -366,6 +390,7 @@ class Gateway:
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
         username, prefix, origin, session = ingress_context(request)
+        has_origin = check_browser_origin(request.headers, origin)
         await self.validate(session)
         raw_path = request.rel_url.raw_path
         if raw_path == prefix:
@@ -390,6 +415,8 @@ class Gateway:
             raw_path += "?" + request.rel_url.raw_query_string
         target = URL(f"http://127.0.0.1:{instance.port}" + raw_path, encoded=True)
         headers = proxy_headers(request.headers)
+        if has_origin:
+            headers["Origin"] = str(target.origin())
         headers["Authorization"] = aiohttp.encode_basic_auth("opencode", instance.password)
         headers["X-Forwarded-Prefix"] = prefix
         headers["X-Forwarded-Proto"] = urlsplit(origin).scheme

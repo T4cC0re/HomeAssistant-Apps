@@ -1,0 +1,69 @@
+#include <tunables/global>
+
+profile opencode flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # Let OpenCode run development tools and access their files.
+  file,
+  /** ix,
+  network,
+  capability,
+  signal,
+  ptrace,
+  unix,
+  mount,
+  remount,
+  umount,
+  change_profile -> **//sandbox,
+
+  # Keep the shared mise tools and configuration read-only.
+  deny /usr/bin/mise wl,
+  deny /usr/local/bin/mise wl,
+  deny /etc/mise{,/**} wl,
+  deny /opt/mise{,/**} wl,
+  deny /opt/mise-config{,/**} wl,
+  deny /opt/opencode-addon/mise.toml wl,
+  deny /usr/local/share/mise{,/**} wl,
+  deny /root/.local/share/mise{,/**} wl,
+  deny /data/mise{,/**} wl,
+
+  profile sandbox flags=(attach_disconnected,mediate_deleted) {
+    #include <abstractions/base>
+
+    network,
+    unix,
+    signal (receive),
+    signal (send) peer=**//sandbox,
+    ptrace peer=**//sandbox,
+
+    # Run system tools without changing their files.
+    / r,
+    /{bin,sbin,lib,lib64,usr,etc,opt}/{,**} rmix,
+    deny /{bin,sbin,lib,lib64,usr,etc,opt}/{,**} wl,
+
+    # The private home contains only this user's persistent data.
+    /home/ r,
+    /home/opencode/{,**} rwklmix,
+    /homeassistant/{,**} rwklmix,
+    /tmp/{,**} rwklmix,
+    /var/tmp/{,**} rwklmix,
+    /dev/shm/{,**} rwklmix,
+
+    /dev/{null,zero,random,urandom,tty,ptmx} rw,
+    /dev/pts/{,**} rw,
+    /proc/{,**} r,
+    /sys/{,**} r,
+
+    # Do not permit a return to the gateway's privileges or filesystem.
+    deny capability,
+    deny mount,
+    deny remount,
+    deny umount,
+    deny pivot_root,
+    deny /data{,/**} rwklmx,
+    deny /root{,/**} rwklmx,
+    deny /run{,/**} rwklmx,
+    deny /proc/** wklx,
+    deny /sys/** wklx,
+  }
+}

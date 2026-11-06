@@ -10,11 +10,10 @@ litellm_discovery: true
 | Option | Default | Function |
 | --- | --- | --- |
 | `lazy_start` | `true` | Start a user's server on the first valid ingress request. If `false`, start all users in the database when the app starts. |
-| `litellm_discovery` | `true` | Read the LiteLLM model list. If `false`, use the fixed provider without discovered models. |
+| `litellm_discovery` | `true` | Read the LiteLLM app settings and enable the model discovery plugin. |
 
-The app checks whether LiteLLM is installed for both settings. If LiteLLM
-is absent, the app logs a warning and continues. OpenCode can use other
-providers that you configure in its web interface or user configuration.
+When discovery is enabled, the app reads the installed LiteLLM app settings.
+If LiteLLM is unavailable, OpenCode starts without the generated connection.
 
 ## Request authentication
 
@@ -34,9 +33,9 @@ errors, and watchdog events. It uses the user name to select a process.
 The `X-Remote-User-Id` header and the session cookie do not select a process.
 
 The gateway calls `POST /ingress/validate_session`. Home Assistant
-currently restricts this endpoint to Core, even when an app has the admin
-role. The gateway recognizes only the exact Core restriction response
-after a successful authenticated app information request. In that case,
+currently restricts this endpoint to Core. The gateway recognizes only the
+exact Core or role restriction response after a successful authenticated
+installed-app list request. In that case,
 it uses the session validation that Supervisor completed before it sent
 the ingress request. Other API errors cause the request to fail.
 
@@ -66,10 +65,20 @@ password is not sent to the browser. The gateway removes ingress cookies,
 user identity headers, and client authorization before it sends a
 request to OpenCode.
 
-Each user has `HOME=/data/<username>`. The app creates private configuration,
-cache, state, and temporary directories in that home. It runs the process
-with numeric user ID `10000 + id` and group `0`. It does not pass the
-Supervisor token or the parent environment to the process.
+When a request includes a browser `Origin` header, it must match the current
+public Home Assistant origin. The gateway then uses the local OpenCode
+origin for the backend request. This permits terminal connection tokens and
+WebSocket connections even when the instance starts before ingress is used
+or the public Home Assistant URL changes. A different browser origin is
+rejected before the gateway contacts OpenCode.
+
+The app stores each user's files at `/data/<username>`. Inside the sandbox,
+the same directory is `/home/opencode`, with `HOME=/home/opencode`.
+The app creates private configuration, cache, state, and temporary
+directories in that home. It runs the process
+with numeric user ID `10000 + id` and group `0`. It passes the parent
+environment except the Supervisor token. App-generated user and server
+settings take precedence over the parent environment.
 
 The gateway detects the public URL and ingress prefix from each trusted
 request. It uses them to forward that request.
@@ -84,13 +93,34 @@ Limits in Home Assistant or an external proxy can still apply.
 
 ## Filesystem access
 
-The `opencode` mise task limits the environment passed to each process.
-It does not apply a Landlock file sandbox. Home Assistant OS does not
-include Landlock in the host kernel. The process starts in its own home
-directory. Its numeric user ID and directory permissions prevent access
-to `/data/users.db`, `/data/options.json`, and other users' homes.
-It can access other paths that normal file permissions allow. Network
-access stays enabled for model APIs and tools.
+Each OpenCode process has a private mount namespace and an AppArmor child
+profile. Its home is mounted at `/home/opencode`. The original `/data`
+tree, the gateway's root home, and `/run` are hidden. Each instance also
+has private `/tmp`, `/var/tmp`, and `/dev/shm` filesystems. Mount changes
+do not affect the gateway or other instances.
+
+System tools, mise installations, and configuration are mounted read-only.
+The child profile permits writes in the user's home, temporary directories,
+and `/homeassistant`. It permits development tools and network access.
+Normal file permissions still apply. User mise caches and state are stored
+in the private home. All child processes inherit the restrictions.
+
+The launcher needs Linux mount namespaces, `mount_setattr`, the app's
+enforced AppArmor profile, and the `SYS_ADMIN` capability declared in the
+manifest. It drops all capabilities and sets the user's numeric identity
+before it enters the child profile. It then prevents new privileges.
+If any step fails, the OpenCode instance does not start. The app does not
+use Landlock or create AppArmor profiles at runtime.
+
+If sandbox setup fails, the app log shows the original error followed by
+a `Sandbox diagnostics` record. This record contains the active AppArmor
+label, effective user ID, `SYS_ADMIN` availability, seccomp state, and the
+failed mount target and flags. Unavailable process details are marked
+`unavailable`. Credentials and environment contents are not included.
+
+After an AppArmor profile change, use the normal Home Assistant app
+update. A rebuild does not reload the AppArmor profile. A mount denial
+can have other causes; the diagnostics do not confirm a stale profile.
 
 Home Assistant mounts its configuration at `/homeassistant`. All users
 share this directory. Normal file permissions apply to each numeric user
@@ -99,42 +129,30 @@ OpenCode. The app does not change permissions on the Home Assistant
 configuration.
 
 You can keep an OpenCode configuration at
-`/data/<username>/.config/opencode/opencode.json`. The app supplies its
+`/data/<username>/.config/opencode/opencode.json`. Inside the sandbox,
+this file is `/home/opencode/.config/opencode/opencode.json`. The app supplies its
 server and LiteLLM settings through `OPENCODE_CONFIG_CONTENT`, which
-OpenCode applies after file configuration. The app always sets its LiteLLM
-provider URL and name. Set `litellm_discovery: false` to skip model discovery.
+OpenCode applies after file configuration. The app adds the LiteLLM plugin
+when discovery succeeds. Set `litellm_discovery: false` to disable this
+connection.
 
 ## LiteLLM and discovery
 
-On startup, the app calls `GET /discovery` and logs the response without
-private configuration values. Master keys, tokens, and unknown
-configuration values are redacted.
+The app reads the installed app list and the LiteLLM app information from
+Supervisor. It uses the LiteLLM hostname, port `4000`, `server_root_path`,
+and `master_key`. It passes the key as `LITELLM_MASTER_KEY` to each user
+process. Every OpenCode user can access this key and its LiteLLM privileges.
+The app does not log the key or Supervisor responses.
 
-The app also probes `http://supervisor/addons/self/info`,
-`http://supervisor/info`,
-`http://supervisor/core/api/hassio/discovery`, and
-`http://homeassistant/api/hassio/discover`. It sends the app's
-`SUPERVISOR_TOKEN` on each request. It logs each HTTP status and the
-response body, or a connection error. These response bodies can contain
-private data. The app never logs the request token. A denied or unreachable
-probe does not stop startup. If a probe returns valid discovery data, the
-app can use it for the LiteLLM provider.
+The `opencode-plugin-litellm` npm plugin discovers models and pricing. It
+uses the LiteLLM model information endpoint when available. The app starts
+without the generated connection if LiteLLM is absent, its settings are
+invalid, or Supervisor access fails. If more than one LiteLLM app is
+installed, discovery stops and the app logs a warning.
 
-Home Assistant currently restricts this endpoint to Core. If the call is
-denied, the app checks `http://192.168.178.147:8123/api/hassio/discover`
-and `/api/hassio/discovery` with its admin-role app token. It logs each
-HTTP status and a redacted response. The Core proxy can also deny these
-paths. If all calls fail, OpenCode starts without the LiteLLM provider.
-The app does not read LiteLLM options. It still checks whether LiteLLM is
-installed and logs a warning when it is absent.
-
-The provider uses `@ai-sdk/openai-compatible`, the name
-`homeassistant-litellm`, and the URL
-`http://aca25ede-litellm:4000/inference/v1`. OpenCode receives no API key
-for this provider. The app can still use discovered LiteLLM credentials to
-read `/models` and fill the model list. If that request fails, the app logs
-a warning. You can supply `provider.litellm.models` in your OpenCode
-configuration or restart the app after LiteLLM is ready.
+The plugin normalizes URLs to a `/v1` API endpoint. LiteLLM also exposes its
+routes without the configured root prefix. Check discovery after changing
+`server_root_path`, especially when it does not end in `/v1`.
 
 ## Watchdog
 

@@ -1,4 +1,6 @@
 [tools]
+python = "3.15.2"
+"aqua:anomalyco/opencode" = "2.2.5"
 "aqua:BurntSushi/ripgrep" = "15.2.0"
 node = "26.13.0"
 go = "1.27.3"
@@ -10,29 +12,33 @@ npm = "12.2.1"
 "npm:typescript-language-server" = "6.0.3"
 "npm:yaml-language-server" = "2.0.0"
 
+[bootstrap.packages]
+"apt:ca-certificates"= "latest" # "20260816ubuntu0.26.04.1"
+"apt:libatomic1"= "latest" # "16-20260322-1ubuntu1"
+
+[bootstrap.apt.sources]
+archive = { 
+  uris = "http://archive.ubuntu.com/ubuntu/",
+  components = ["main", "universe", "restricted", "multiverse"],
+  suites = ["resolute", "resolute-backports", "resolute-updates", "resolute-security"],
+ }
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+
+[settings]
+auto_install = true
+python.compile = false
+experimental = true
+activate_aggressive = true
+exec_auto_install = true
+pin = true
+
 [tasks.opencode]
 description = "Start the OpenCode instance for one user."
 dir = "{{ env.HOME }}"
 run = 'exec opencode serve --hostname 127.0.0.1 --port "$OPENCODE_PORT" --print-logs'
 quiet = false
-deny_env = true
-allow_env = [
-  "OPENCODE_USERNAME",
-  "OPENCODE_PORT",
-  "OPENCODE_CONFIG_CONTENT",
-  "OPENCODE_SERVER_PASSWORD",
-  "OPENCODE_SERVER_USERNAME",
-  "OPENCODE_PUBLIC_URL",
-  "OPENCODE_INGRESS_PATH",
-  "OPENCODE_DISABLE_AUTOUPDATE",
-  "XDG_CONFIG_HOME",
-  "XDG_DATA_HOME",
-  "XDG_CACHE_HOME",
-  "XDG_STATE_HOME",
-  "MISE_*",
-  "LITELLM_*",
-  "TMPDIR",
-]
 
 [tasks.opencode.env]
 OPENCODE_DISABLE_AUTOUPDATE = "true"
@@ -44,9 +50,9 @@ run = """
 set -xeufo pipefail
 OPENCODE_SMB_MOUNT=$(mktemp -d /private/tmp/opencode-smb.XXXXXX)
 mount_smbfs //homeassistant:homeassistant@192.168.178.147/local_apps "$OPENCODE_SMB_MOUNT"
-rsync -rlt --checksum --delete --dry-run --itemize-changes --exclude='__pycache__/' --exclude='*.pyc' ./ "$OPENCODE_SMB_MOUNT/opencode/"
-rsync -rlt --checksum --delete --itemize-changes --exclude='__pycache__/' --exclude='*.pyc' ./ "$OPENCODE_SMB_MOUNT/opencode/"
-rsync -rlt --checksum --delete --dry-run --itemize-changes --exclude='__pycache__/' --exclude='*.pyc' ./ "$OPENCODE_SMB_MOUNT/opencode/"
+rsync -rlt --checksum --delete --dry-run --itemize-changes --exclude='.venv/' --exclude='__pycache__/' --exclude='*.pyc' ./ "$OPENCODE_SMB_MOUNT/opencode/"
+rsync -rlt --checksum --delete --itemize-changes --exclude='.venv/' --exclude='__pycache__/' --exclude='*.pyc' ./ "$OPENCODE_SMB_MOUNT/opencode/"
+rsync -rlt --checksum --delete --dry-run --itemize-changes --exclude='.venv/' --exclude='__pycache__/' --exclude='*.pyc' ./ "$OPENCODE_SMB_MOUNT/opencode/"
 umount "$OPENCODE_SMB_MOUNT"
 rmdir "$OPENCODE_SMB_MOUNT"
 """

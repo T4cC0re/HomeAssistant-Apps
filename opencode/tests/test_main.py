@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, patch
 import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from multidict import CIMultiDict
 from yarl import URL
 
 import main
@@ -52,25 +53,26 @@ class StoreTests(unittest.TestCase):
     def test_home_and_environment_are_private(self):
         with tempfile.TemporaryDirectory() as directory:
             store = main.UserStore(Path(directory))
-            manager = main.Instances(store, None, {"provider": {"litellm": {
-                "options": {"baseURL": "http://discovered:4000/v1", "apiKey": "model-key"},
-                "models": {"model-a": {"name": "Model A"}},
-            }}})
+            manager = main.Instances(store, None, {"base_url": "http://discovered:4000/v1", "master_key": "model-key"})
             home = manager.home(1, "Alice")
-            env = manager.environment(1, "Alice", home, PREFIX, "https://ha.example", "backend-key")
+            with patch.dict(os.environ, {"SUPERVISOR_TOKEN": "gateway-only", "HASSIO_TOKEN": "legacy-token",
+                                         "CUSTOM_SETTING": "passed", "HOME": "wrong"}):
+                env = manager.environment(1, "Alice", PREFIX, "https://ha.example", "backend-key")
             self.assertEqual(home.stat().st_mode & 0o777, 0o700)
-            self.assertEqual(env["HOME"], str(home))
+            self.assertEqual(env["HOME"], "/home/opencode")
+            self.assertEqual(env["TMPDIR"], "/home/opencode/.tmp")
+            self.assertEqual(env["XDG_CONFIG_HOME"], "/home/opencode/.config")
             self.assertEqual(env["OPENCODE_PORT"], "8081")
             self.assertNotIn("SUPERVISOR_TOKEN", env)
-            self.assertNotIn("AWS_SECRET_ACCESS_KEY", env)
+            self.assertNotIn("HASSIO_TOKEN", env)
+            self.assertEqual(env["CUSTOM_SETTING"], "passed")
+            self.assertEqual(env["LITELLM_MASTER_KEY"], "model-key")
             config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
             self.assertEqual(config["server"]["cors"], ["https://ha.example"])
-            provider = config["provider"]["litellm"]
-            self.assertEqual(provider["name"], "homeassistant-litellm")
-            self.assertEqual(provider["npm"], "@ai-sdk/openai-compatible")
-            self.assertEqual(provider["options"], {"baseURL": "http://aca25ede-litellm:4000/inference/v1"})
-            self.assertNotIn("apiKey", provider["options"])
-            self.assertEqual(provider["models"], {"model-a": {"name": "Model A"}})
+            self.assertEqual(config["plugins"], ["opencode-plugin-litellm@1.10.0"])
+            self.assertEqual(config["providers"]["litellm"]["settings"], {
+                "baseURL": "http://discovered:4000/v1", "apiKey": "{env:LITELLM_MASTER_KEY}"})
+            self.assertNotIn("model-key", env["OPENCODE_CONFIG_CONTENT"])
             other = Path(directory) / "Bob"
             other.symlink_to(home, target_is_directory=True)
             with self.assertRaises(ValueError):
@@ -90,7 +92,7 @@ class StoreTests(unittest.TestCase):
         config = tomllib.loads((main.APP_DIR / "mise.toml").read_text())
         task = config["tasks"]["opencode"]
         self.assertEqual(task["dir"], "{{ env.HOME }}")
-        self.assertTrue(task["deny_env"])
+        self.assertFalse(task.get("deny_env", False))
         self.assertFalse({"deny_read", "deny_write", "allow_read", "allow_write"} & task.keys())
 
 
@@ -331,6 +333,172 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/global/health", headers=self.headers)
         self.assertEqual(response.status, 200)
         self.assertEqual(self.manager.seen_users, {"Alice": 1})
+
+    async def test_terminal_token_rewrites_public_origin_and_keeps_authentication(self):
+        received = []
+        terminal = "/api/experimental/persistent-pty/pty_persistent_probe/connect-token"
+
+        async def token(request):
+            received.append((request.method, request.raw_path, request.headers))
+            if (request.headers.get("Origin") != f"http://{request.host}"
+                    or request.headers.get("x-opencode-ticket") != "1"):
+                return web.Response(status=403, text="Invalid persistent request")
+            return web.json_response({"ticket": "test-ticket"})
+
+        server = await self.upstream(token)
+        for origin in ("https://ha.example", "https://HA.EXAMPLE:443"):
+            with self.subTest(origin=origin):
+                response = await self.client.post(
+                    URL(PREFIX + terminal + "?directory=%2Fhome%2Fopencode", encoded=True),
+                    headers={**self.headers, "Origin": origin, "x-opencode-ticket": "1",
+                             "Authorization": "Bearer browser-credential"},
+                )
+                self.assertEqual(response.status, 200)
+                self.assertEqual(await response.json(), {"ticket": "test-ticket"})
+        self.assertEqual(len(received), 2)
+        for method, path, headers in received:
+            self.assertEqual(method, "POST")
+            self.assertEqual(path, terminal + "?directory=%2Fhome%2Fopencode")
+            self.assertEqual(headers["Origin"], f"http://127.0.0.1:{server.port}")
+            self.assertEqual(headers["x-opencode-ticket"], "1")
+            self.assertEqual(headers["Authorization"], aiohttp.encode_basic_auth("opencode", "private-backend-password"))
+            self.assertEqual(headers["X-Forwarded-Proto"], "https")
+            self.assertEqual(headers["X-Forwarded-Host"], "ha.example")
+            self.assertEqual(headers["X-Forwarded-Prefix"], PREFIX)
+            self.assertNotIn("Cookie", headers)
+
+    async def test_request_without_origin_does_not_add_a_backend_origin(self):
+        received = []
+
+        async def token(request):
+            received.append(request.headers)
+            return web.json_response({"ticket": "test-ticket"})
+
+        await self.upstream(token)
+        response = await self.client.post(
+            PREFIX + "/api/experimental/persistent-pty/pty_persistent_probe/connect-token",
+            headers={**self.headers, "x-opencode-ticket": "1"},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.json(), {"ticket": "test-ticket"})
+        self.assertEqual(len(received), 1)
+        self.assertNotIn("Origin", received[0])
+        self.assertEqual(received[0]["x-opencode-ticket"], "1")
+
+    async def test_invalid_origins_do_not_validate_sessions_or_contact_the_backend(self):
+        received = []
+
+        async def backend(request):
+            received.append(request.path)
+            return web.Response(text="unexpected")
+
+        await self.upstream(backend)
+        origins = (
+            "https://other.example", "http://ha.example", "https://ha.example:444",
+            "null", "", "invalid-origin", "https://", "https://[",
+            "https://ha.example/path", "https://ha.example/", "https://ha.example?ticket=bad",
+            "https://ha.example?", "https://ha.example#", "https://ha.ex\tample",
+            "https://ha.example#fragment", "https://user@ha.example", "https://user:password@ha.example",
+            "https://ha.example https://other.example", "https://ha.example,https://other.example",
+        )
+        for origin in origins:
+            with self.subTest(origin=origin):
+                response = await self.client.post(
+                    PREFIX + "/api/experimental/persistent-pty/pty_persistent_probe/connect-token",
+                    headers={**self.headers, "Origin": origin, "x-opencode-ticket": "1"},
+                )
+                self.assertEqual(response.status, 403)
+                await response.read()
+        self.assertEqual(received, [])
+        self.assertEqual(self.store.all(), [])
+        self.supervisor.validate_session.assert_not_awaited()
+        self.ensure.assert_not_awaited()
+
+    async def test_duplicate_origins_do_not_validate_sessions_or_contact_the_backend(self):
+        received = []
+
+        async def backend(request):
+            received.append(request.path)
+            return web.Response(text="unexpected")
+
+        await self.upstream(backend)
+        for second in ("https://ha.example", "https://other.example"):
+            with self.subTest(second=second):
+                headers = CIMultiDict(self.headers)
+                headers.add("Origin", "https://ha.example")
+                headers.add("Origin", second)
+                response = await self.client.post(
+                    PREFIX + "/api/experimental/persistent-pty/pty_persistent_probe/connect-token",
+                    headers=headers,
+                )
+                self.assertEqual(response.status, 403)
+                await response.read()
+        self.assertEqual(received, [])
+        self.assertEqual(self.store.all(), [])
+        self.supervisor.validate_session.assert_not_awaited()
+        self.ensure.assert_not_awaited()
+
+    async def test_current_public_origin_works_with_the_same_backend(self):
+        received = []
+
+        async def token(request):
+            received.append(request.headers)
+            if request.headers.get("Origin") != f"http://{request.host}":
+                return web.Response(status=403, text="Invalid persistent request")
+            return web.json_response({"ticket": "test-ticket"})
+
+        server = await self.upstream(token)
+        for host in ("ha.example", "other.example:8443"):
+            with self.subTest(host=host):
+                response = await self.client.post(
+                    PREFIX + "/api/experimental/persistent-pty/pty_persistent_probe/connect-token",
+                    headers={**self.headers, "X-Forwarded-Host": host, "Origin": "https://" + host,
+                             "x-opencode-ticket": "1"},
+                )
+                self.assertEqual(response.status, 200)
+                await response.read()
+        self.assertEqual([headers["Origin"] for headers in received], [f"http://127.0.0.1:{server.port}"] * 2)
+        self.assertEqual([headers["X-Forwarded-Host"] for headers in received], ["ha.example", "other.example:8443"])
+        self.assertEqual([call.args for call in self.ensure.await_args_list], [
+            (1, "Alice", PREFIX, "https://ha.example"),
+            (1, "Alice", PREFIX, "https://other.example:8443"),
+        ])
+        self.assertEqual(self.store.all(), [(1, "Alice")])
+
+    async def test_terminal_websocket_rewrites_origin_and_keeps_the_ticket(self):
+        received = []
+        terminal = "/api/experimental/persistent-pty/pty_persistent_probe/connect"
+
+        async def echo(request):
+            received.append((request.raw_path, request.headers))
+            if (request.headers.get("Origin") != f"http://{request.host}"
+                    or request.query.get("ticket") != "test-ticket"):
+                return web.Response(status=403, text="Invalid persistent request")
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            async for message in ws:
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    await ws.send_str(message.data)
+            return ws
+
+        server = await self.upstream(echo)
+        async with self.client.ws_connect(
+            URL(PREFIX + terminal + "?ticket=test-ticket&cursor=%25", encoded=True),
+            headers={**self.headers, "Origin": "https://ha.example"},
+        ) as ws:
+            await ws.send_str("terminal echo")
+            message = await asyncio.wait_for(ws.receive(), 2)
+            self.assertEqual(message.type, aiohttp.WSMsgType.TEXT)
+            self.assertEqual(message.data, "terminal echo")
+        self.assertEqual(len(received), 1)
+        path, headers = received[0]
+        self.assertEqual(path, terminal + "?ticket=test-ticket&cursor=%25")
+        self.assertEqual(headers["Origin"], f"http://127.0.0.1:{server.port}")
+        self.assertEqual(headers["Authorization"], aiohttp.encode_basic_auth("opencode", "private-backend-password"))
+        self.assertEqual(headers["X-Forwarded-Proto"], "https")
+        self.assertEqual(headers["X-Forwarded-Host"], "ha.example")
+        self.assertEqual(headers["X-Forwarded-Prefix"], PREFIX)
+        self.assertNotIn("Cookie", headers)
 
     async def test_large_upload_download_and_header_filter(self):
         payload = b"0123456789abcdef" * (512 * 1024)
@@ -593,6 +761,7 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
                             "X-Remote-User-Name": "Alice", "X-Remote-User-Id": "ha-user-id",
                             "X-Ingress-Path": prefix, "X-Forwarded-Proto": "https",
                             "X-Forwarded-Host": host, "Cookie": f"ingress_session={session}",
+                            "Origin": "https://" + host,
                         }
 
                     process = SimpleNamespace(returncode=None, pid=999)
@@ -632,7 +801,11 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIs(first, second)
                 self.assertEqual(start.await_count, 1)
-                self.assertEqual(start.call_args.args, ("mise", "-C", str(main.APP_DIR), "run", "opencode"))
+                self.assertEqual(start.call_args.args, (
+                    main.sys.executable, "-I", str(main.APP_DIR / "sandbox.py"),
+                    "--home", str(Path(directory) / "Alice"), "--uid", "10001"))
+                self.assertEqual(start.call_args.kwargs["cwd"], "/")
+                self.assertNotIn("user", start.call_args.kwargs)
                 self.assertNotIn("SUPERVISOR_TOKEN", start.call_args.kwargs["env"])
                 third = await manager.ensure(1, "Alice", PREFIX + "-new", "https://other.example")
                 self.assertIs(third, first)
